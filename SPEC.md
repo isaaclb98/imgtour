@@ -47,9 +47,18 @@ Example (8 images, 3 rounds):
     "imageA": "/images/photo1.jpg",
     "imageB": "/images/photo2.png",
     "completed": false
+  },
+  "nextMatch": {
+    "id": 6,
+    "round": 3,
+    "imageA": "/images/photo3.jpg",
+    "imageB": "/images/photo4.png",
+    "completed": false
   }
 }
 ```
+
+`nextMatch` is null when the tournament is complete, or when the next round's matches have not yet been generated (during active rounds).
 
 ## Database Schema (SQLite)
 
@@ -210,6 +219,8 @@ No framework. No build step. Pure browser JS.
 ### Image Loading
 
 Images are loaded directly via `img.src = '/api/images/' + imagePath` on each match update. The browser handles caching automatically.
+
+After each vote response, the next match's images are prefetched via `new Image()` so the browser HTTP cache is warm before the user clicks again. This eliminates perceptible latency on every transition after the first match.
 
 ### Double-Click Protection
 
