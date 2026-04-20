@@ -1015,7 +1015,7 @@ async def undo_last_match(request: Request) -> Response:
                     completed_at = NULL
                 WHERE id = ?
                 """,
-                (undone_round, previous_match["id"] if previous_match else None, tournament_uuid),
+                (max(undone_round - 1, 1), previous_match["id"] if previous_match else None, tournament_uuid),
             )
 
             await db.commit()
