@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>imgtour</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0a0a;
+      --dim: rgba(255,255,255,0.25);
+      --glow: rgba(255,255,255,0.06);
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: #fff;
+      font-family: system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    #chrome {
+      position: fixed;
+      top: 14px;
+      right: 18px;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    #progress {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      color: var(--dim);
+      cursor: default;
+      line-height: 1;
+    }
+
+    #undo-btn {
+      background: none;
+      border: none;
+      padding: 4px;
+      cursor: pointer;
+      color: rgba(255,255,255,0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      transition: color 0.15s, background 0.15s;
+      line-height: 1;
+    }
+    #undo-btn:hover { color: rgba(255,255,255,0.9); background: var(--glow); }
+    #undo-btn:active { opacity: 0.6; }
+    #undo-btn svg { width: 16px; height: 16px; display: block; }
+
+    #match {
+      display: flex;
+      width: 100vw;
+      height: 100vh;
+      gap: 0;
+    }
+
+    .choice {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+      padding: 2%;
+    }
+
+    .choice:hover { background: var(--glow); }
+
+    .choice img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    @keyframes pulse {
+      0% { opacity: 1; }
+      40% { opacity: 0.3; }
+      100% { opacity: 1; }
+    }
+    .choice.pulse { animation: pulse 0.25s ease-out; }
+
+    #results {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      gap: 32px;
+    }
+
+    #results h1 {
+      font-size: 13px;
+      font-weight: 400;
+      letter-spacing: 0.12em;
+      color: var(--dim);
+      text-transform: uppercase;
+    }
+
+    #download-btn {
+      background: rgba(255,255,255,0.08);
+      border: none;
+      color: rgba(255,255,255,0.7);
+      padding: 10px 24px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      transition: background 0.15s, color 0.15s;
+    }
+    #download-btn:hover { background: rgba(255,255,255,0.14); color: #fff; }
+
+    #loading {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      z-index: 200;
+    }
+    #loading.active { display: flex; }
+    .spinner {
+      width: 24px; height: 24px;
+      border: 2px solid rgba(255,255,255,0.1);
+      border-top-color: rgba(255,255,255,0.4);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+  <div id="chrome">
+    <span id="progress">Match 1/7</span>
+    <button id="undo-btn" title="Undo last pick" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="1 4 1 10 7 10"></polyline>
+        <path d="M3.51 15a9 9 0 1 0 .49-4.95"></path>
+      </svg>
+    </button>
+  </div>
+
+  <div id="match">
+    <div class="choice" id="choice-a">
+      <img id="img-a" alt="">
+    </div>
+    <div class="choice" id="choice-b">
+      <img id="img-b" alt="">
+    </div>
+  </div>
+
+  <div id="results">
+    <h1>Tournament complete</h1>
+    <button id="download-btn">Download CSV</button>
+  </div>
+
+  <div id="loading">
+    <div class="spinner"></div>
+  </div>
+
+  <div id="preload-pool" style="display:none">
+    <img id="preload-a" src="">
+    <img id="preload-b" src="">
+  </div>
+
+  <script>
+    const S = {
+      uuid: null,
+      tournament: null,
+      currentMatch: null,
+      disabled: false,
+    };
+
+    async function api(path, opts) {
+      const r = await fetch(path, opts || {});
+      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+      return r.json();
+    }
+
+    async function init() {
+      const list = await api('/api/tournament').catch(() => null);
+      if (list && list.active_uuid) {
+        S.uuid = list.active_uuid;
+      } else {
+        const created = await api('/api/tournament', { method: 'POST' });
+        S.uuid = created.uuid;
+      }
+      await loadTournament();
+    }
+
+    async function loadTournament() {
+      S.tournament = await api(`/api/tournament/${S.uuid}`);
+      const match = await api(`/api/match/${S.tournament.current_match_id}`);
+      S.currentMatch = match;
+      updateUI();
+      preloadNext();
+    }
+
+    function updateUI() {
+      const t = S.tournament;
+      const m = S.currentMatch;
+      if (!t || !m) return;
+
+      document.getElementById('progress').textContent =
+        `Match ${t.current_match_index + 1}/${t.total_matches}`;
+
+      const imgA = document.getElementById('img-a');
+      const imgB = document.getElementById('img-b');
+      const preloadA = document.getElementById('preload-a');
+      const preloadB = document.getElementById('preload-b');
+
+      if (preloadA.src && preloadA.complete) {
+        imgA.src = preloadA.src;
+        imgB.src = preloadB.src;
+        preloadA.removeAttribute('src');
+        preloadB.removeAttribute('src');
+      } else {
+        imgA.src = `/api/images/${m.image_a}`;
+        imgB.src = `/api/images/${m.image_b}`;
+      }
+
+      document.getElementById('undo-btn').disabled =
+        t.status === 'COMPLETE' || !t.last_match_id;
+    }
+
+    async function preloadNext() {
+      const t = await api(`/api/tournament/${S.uuid}`).catch(() => null);
+      if (!t || t.status === 'COMPLETE') return;
+      const m = await api(`/api/match/${t.current_match_id}`).catch(() => null);
+      if (!m) return;
+      document.getElementById('preload-a').src = `/api/images/${m.image_a}`;
+      document.getElementById('preload-b').src = `/api/images/${m.image_b}`;
+    }
+
+    async function vote(winnerPath) {
+      if (S.disabled || !S.currentMatch) return;
+      S.disabled = true;
+
+      const el = winnerPath === S.currentMatch.image_a
+        ? document.getElementById('choice-a')
+        : document.getElementById('choice-b');
+      el.classList.add('pulse');
+
+      try {
+        const result = await api(`/api/match/${S.currentMatch.id}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ winner: winnerPath }),
+        });
+        if (result.status === 'complete') {
+          document.getElementById('match').style.display = 'none';
+          document.getElementById('chrome').style.display = 'none';
+          document.getElementById('results').style.display = 'flex';
+        } else {
+          S.currentMatch = result.current_match || result.match;
+          S.tournament = result.tournament;
+          updateUI();
+          preloadNext();
+        }
+      } catch (e) {
+        console.error(e);
+      } finally {
+        S.disabled = false;
+        el.classList.remove('pulse');
+      }
+    }
+
+    async function undo() {
+      if (!S.uuid) return;
+      try {
+        await api(`/api/tournament/${S.uuid}/undo`, { method: 'POST' });
+        await loadTournament();
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    document.getElementById('choice-a').addEventListener('click', () => {
+      if (!S.currentMatch || S.disabled) return;
+      vote(S.currentMatch.image_a);
+    });
+    document.getElementById('choice-b').addEventListener('click', () => {
+      if (!S.currentMatch || S.disabled) return;
+      vote(S.currentMatch.image_b);
+    });
+    document.getElementById('undo-btn').addEventListener('click', undo);
+    document.getElementById('download-btn').addEventListener('click', () => {
+      window.location.href = `/api/tournament/${S.uuid}/export`;
+    });
+
+    // double-click protection
+    document.querySelectorAll('.choice').forEach(el => {
+      el.addEventListener('pointerdown', () => {
+        if (S.disabled) return;
+        S.disabled = true;
+        setTimeout(() => { S.disabled = false; }, 3000);
+      }, { capture: true });
+    });
+
+    document.getElementById('loading').classList.add('active');
+    init().catch(e => console.error(e)).finally(() => {
+      document.getElementById('loading').classList.remove('active');
+    });
+  </script>
+</body>
+</html>
