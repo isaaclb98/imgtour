@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import random
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -39,6 +40,15 @@ IMAGE_EXTENSIONS = {
 LOGGER = logging.getLogger("imgtour")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
+# Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
+_UUID4_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I
+)
+
+
+def is_valid_uuid(value: str) -> bool:
+    return bool(_UUID4_RE.match(value))
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -72,6 +82,8 @@ def parse_image_folders() -> list[Path]:
 
 
 def db_path_for_uuid(tournament_uuid: str) -> Path:
+    if not is_valid_uuid(tournament_uuid):
+        raise HTTPException(status_code=400, detail="Invalid tournament UUID")
     return DATA_DIR / f"tournament_{tournament_uuid}.db"
 
 
@@ -121,7 +133,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_matches_tournament ON matches(tournament_id);
+        CREATE INDEX IF NOT EXISTS idx_matches_trw ON matches(tournament_id, round, winner_path);
         CREATE INDEX IF NOT EXISTS idx_images_tournament ON images(tournament_id);
+        CREATE INDEX IF NOT EXISTS idx_images_tournament_round ON images(tournament_id, round_reached);
         """
     )
     await db.commit()
@@ -355,7 +369,8 @@ async def build_tournament_state(db: aiosqlite.Connection, tournament_uuid: str)
 
 async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    image_paths, image_folder_value = scan_images(image_roots)
+    # scan_images is fully synchronous — run on thread pool to avoid blocking the event loop
+    image_paths, image_folder_value = await asyncio.to_thread(scan_images, image_roots)
     if not image_paths:
         LOGGER.warning("No valid images found in IMAGE_FOLDERS")
         return None
@@ -405,13 +420,12 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
         LOGGER.info("Created tournament %s with %s images", tournament_uuid, total_images)
         return tournament_uuid
     except Exception:
-        await db.close()
+        LOGGER.exception("Failed to create tournament %s", tournament_uuid)
         if db_path.exists():
             db_path.unlink(missing_ok=True)
         raise
     finally:
-        if db._running:
-            await db.close()
+        await db.close()
 
 
 async def find_active_tournament_uuid() -> str | None:
@@ -547,6 +561,28 @@ async def get_match(request: Request) -> Response:
     match_id = int(request.path_params["match_id"])
 
     async def _find_match() -> aiosqlite.Row | None:
+        # Fast path: check active tournament DB first (common case)
+        active_uuid = app.state.active_uuid
+        if active_uuid:
+            active_path = db_path_for_uuid(active_uuid)
+            if active_path.exists():
+                db = await aiosqlite.connect(active_path)
+                db.row_factory = aiosqlite.Row
+                try:
+                    row = await fetchone(
+                        db,
+                        """
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        FROM matches
+                        WHERE id = ?
+                        """,
+                        (match_id,),
+                    )
+                    if row:
+                        return row
+                finally:
+                    await db.close()
+        # Slow path: scan all tournament DBs
         for path in sorted(DATA_DIR.glob("tournament_*.db")):
             db = await aiosqlite.connect(path)
             db.row_factory = aiosqlite.Row
@@ -582,25 +618,49 @@ async def record_match_result(request: Request) -> Response:
     async with app.state.lock:
         match_row = None
         target_db_path = None
-        for path in sorted(DATA_DIR.glob("tournament_*.db")):
-            db = await aiosqlite.connect(path)
-            db.row_factory = aiosqlite.Row
-            try:
-                row = await fetchone(
-                    db,
-                    """
-                    SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
-                    FROM matches
-                    WHERE id = ?
-                    """,
-                    (match_id,),
-                )
-                if row:
-                    match_row = row
-                    target_db_path = path
-                    break
-            finally:
-                await db.close()
+        # Fast path: check active tournament DB first
+        active_uuid = app.state.active_uuid
+        if active_uuid:
+            active_path = db_path_for_uuid(active_uuid)
+            if active_path.exists():
+                db = await aiosqlite.connect(active_path)
+                db.row_factory = aiosqlite.Row
+                try:
+                    row = await fetchone(
+                        db,
+                        """
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        FROM matches
+                        WHERE id = ?
+                        """,
+                        (match_id,),
+                    )
+                    if row:
+                        match_row = row
+                        target_db_path = active_path
+                finally:
+                    await db.close()
+        # Slow path: scan all tournament DBs if not found in active
+        if match_row is None:
+            for path in sorted(DATA_DIR.glob("tournament_*.db")):
+                db = await aiosqlite.connect(path)
+                db.row_factory = aiosqlite.Row
+                try:
+                    row = await fetchone(
+                        db,
+                        """
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        FROM matches
+                        WHERE id = ?
+                        """,
+                        (match_id,),
+                    )
+                    if row:
+                        match_row = row
+                        target_db_path = path
+                        break
+                finally:
+                    await db.close()
 
         if match_row is None or target_db_path is None:
             raise HTTPException(status_code=404, detail="Match not found")

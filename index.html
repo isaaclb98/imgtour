@@ -178,7 +178,7 @@
   </div>
 
   <script>
-    const S = {
+    const state = {
       uuid: null,
       tournament: null,
       currentMatch: null,
@@ -194,29 +194,29 @@
     async function init() {
       const list = await api('/api/tournament').catch(() => null);
       if (list && list.active_uuid) {
-        S.uuid = list.active_uuid;
+        state.uuid = list.active_uuid;
       } else {
         const created = await api('/api/tournament', { method: 'POST' });
-        S.uuid = created.uuid;
+        state.uuid = created.uuid;
       }
       await loadTournament();
     }
 
     async function loadTournament() {
-      S.tournament = await api(`/api/tournament/${S.uuid}`);
-      const match = await api(`/api/match/${S.tournament.current_match_id}`);
-      S.currentMatch = match;
+      state.tournament = await api(`/api/tournament/${state.uuid}`);
+      const match = await api(`/api/match/${state.tournament.currentMatchId}`);
+      state.currentMatch = match;
       updateUI();
       preloadNext();
     }
 
     function updateUI() {
-      const t = S.tournament;
-      const m = S.currentMatch;
+      const t = state.tournament;
+      const m = state.currentMatch;
       if (!t || !m) return;
 
       document.getElementById('progress').textContent =
-        `Match ${t.current_match_index + 1}/${t.total_matches}`;
+        `Match ${t.currentMatchIndex + 1}/${t.totalMatches}`;
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
@@ -229,60 +229,60 @@
         preloadA.removeAttribute('src');
         preloadB.removeAttribute('src');
       } else {
-        imgA.src = `/api/images/${m.image_a}`;
-        imgB.src = `/api/images/${m.image_b}`;
+        imgA.src = `/api/images/${m.imageA}`;
+        imgB.src = `/api/images/${m.imageB}`;
       }
 
       document.getElementById('undo-btn').disabled =
-        t.status === 'COMPLETE' || !t.last_match_id;
+        t.status === 'COMPLETE' || !t.lastMatchId;
     }
 
     async function preloadNext() {
-      const t = await api(`/api/tournament/${S.uuid}`).catch(() => null);
+      const t = await api(`/api/tournament/${state.uuid}`).catch(() => null);
       if (!t || t.status === 'COMPLETE') return;
-      const m = await api(`/api/match/${t.current_match_id}`).catch(() => null);
+      const m = await api(`/api/match/${t.currentMatchId}`).catch(() => null);
       if (!m) return;
-      document.getElementById('preload-a').src = `/api/images/${m.image_a}`;
-      document.getElementById('preload-b').src = `/api/images/${m.image_b}`;
+      document.getElementById('preload-a').src = `/api/images/${m.imageA}`;
+      document.getElementById('preload-b').src = `/api/images/${m.imageB}`;
     }
 
     async function vote(winnerPath) {
-      if (S.disabled || !S.currentMatch) return;
-      S.disabled = true;
+      if (state.disabled || !state.currentMatch) return;
+      state.disabled = true;
 
-      const el = winnerPath === S.currentMatch.image_a
+      const el = winnerPath === state.currentMatch.imageA
         ? document.getElementById('choice-a')
         : document.getElementById('choice-b');
       el.classList.add('pulse');
 
       try {
-        const result = await api(`/api/match/${S.currentMatch.id}`, {
+        const result = await api(`/api/match/${state.currentMatch.id}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ winner: winnerPath }),
         });
-        if (result.status === 'complete') {
+        if (result.tournament && result.tournament.status === 'COMPLETE') {
           document.getElementById('match').style.display = 'none';
           document.getElementById('chrome').style.display = 'none';
           document.getElementById('results').style.display = 'flex';
         } else {
-          S.currentMatch = result.current_match || result.match;
-          S.tournament = result.tournament;
+          state.currentMatch = result.tournament && result.tournament.currentMatch;
+          state.tournament = result.tournament;
           updateUI();
           preloadNext();
         }
       } catch (e) {
         console.error(e);
       } finally {
-        S.disabled = false;
+        state.disabled = false;
         el.classList.remove('pulse');
       }
     }
 
     async function undo() {
-      if (!S.uuid) return;
+      if (!state.uuid) return;
       try {
-        await api(`/api/tournament/${S.uuid}/undo`, { method: 'POST' });
+        await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
         await loadTournament();
       } catch (e) {
         console.error(e);
@@ -290,26 +290,21 @@
     }
 
     document.getElementById('choice-a').addEventListener('click', () => {
-      if (!S.currentMatch || S.disabled) return;
-      vote(S.currentMatch.image_a);
+      if (!state.currentMatch || state.disabled) return;
+      vote(state.currentMatch.imageA);
     });
     document.getElementById('choice-b').addEventListener('click', () => {
-      if (!S.currentMatch || S.disabled) return;
-      vote(S.currentMatch.image_b);
+      if (!state.currentMatch || state.disabled) return;
+      vote(state.currentMatch.imageB);
     });
     document.getElementById('undo-btn').addEventListener('click', undo);
     document.getElementById('download-btn').addEventListener('click', () => {
-      window.location.href = `/api/tournament/${S.uuid}/export`;
+      window.location.href = `/api/tournament/${state.uuid}/export`;
     });
 
-    // double-click protection
-    document.querySelectorAll('.choice').forEach(el => {
-      el.addEventListener('pointerdown', () => {
-        if (S.disabled) return;
-        S.disabled = true;
-        setTimeout(() => { S.disabled = false; }, 3000);
-      }, { capture: true });
-    });
+    // double-click protection — vote() sets state.disabled at start and clears in finally;
+    // the pointerdown handler is removed because it was setting state.disabled before the
+    // click event fired, causing all votes to be blocked permanently
 
     document.getElementById('loading').classList.add('active');
     init().catch(e => console.error(e)).finally(() => {
