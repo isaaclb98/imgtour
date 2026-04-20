@@ -51,11 +51,9 @@
       align-items: center;
       justify-content: center;
       border-radius: 4px;
-      transition: color 0.15s, background 0.15s;
       line-height: 1;
     }
     #undo-btn:hover { color: rgba(255,255,255,0.9); background: var(--glow); }
-    #undo-btn:active { opacity: 0.6; }
     #undo-btn svg { width: 16px; height: 16px; display: block; }
 
     #match {
@@ -85,13 +83,6 @@
       display: block;
     }
 
-    @keyframes pulse {
-      0% { opacity: 1; }
-      40% { opacity: 0.3; }
-      100% { opacity: 1; }
-    }
-    .choice.pulse { animation: pulse 0.25s ease-out; }
-
     #results {
       display: none;
       flex-direction: column;
@@ -118,7 +109,6 @@
       cursor: pointer;
       font-size: 13px;
       letter-spacing: 0.04em;
-      transition: background 0.15s, color 0.15s;
     }
     #download-btn:hover { background: rgba(255,255,255,0.14); color: #fff; }
 
@@ -132,14 +122,6 @@
       z-index: 200;
     }
     #loading.active { display: flex; }
-    .spinner {
-      width: 24px; height: 24px;
-      border: 2px solid rgba(255,255,255,0.1);
-      border-top-color: rgba(255,255,255,0.4);
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -169,15 +151,16 @@
   </div>
 
   <div id="loading">
-    <div class="spinner"></div>
   </div>
 
   <script>
     const state = {
       uuid: null,
-      tournament: null,
-      currentMatch: null,
+      matches: [],
+      images: [],
+      currentMatchIndex: 0,
       disabled: false,
+      totalRounds: 0,
     };
 
     async function api(path, opts) {
@@ -191,96 +174,113 @@
       const list = await api('/api/tournament').catch(() => null);
       if (list && list.active_uuid) {
         state.uuid = list.active_uuid;
-        state.tournament = await api(`/api/tournament/${state.uuid}`);
-        state.currentMatch = state.tournament.currentMatch;
+        const t = await api(`/api/tournament/${state.uuid}`);
+        state.matches = t.matches || [];
+        state.images = t.images || [];
+        state.totalRounds = t.totalRounds || 1;
+        state.currentMatchIndex = findCurrentMatchIndex();
       } else {
-        // POST returns full tournament state with uuid + currentMatch — no follow-up GET needed
         const created = await api('/api/tournament', { method: 'POST' });
         state.uuid = created.uuid;
-        state.tournament = created;
-        state.currentMatch = created.currentMatch;
+        state.matches = created.matches || [];
+        state.images = created.images || [];
+        state.totalRounds = created.totalRounds || 1;
+        state.currentMatchIndex = findCurrentMatchIndex();
       }
       updateUI();
       document.getElementById('loading').classList.remove('active');
     }
 
-    function updateUI() {
-      const t = state.tournament;
-      const m = state.currentMatch;
-      if (!t || !m) return;
+    function findCurrentMatchIndex() {
+      for (let i = 0; i < state.matches.length; i++) {
+        if (!state.matches[i].winner) return i;
+      }
+      return state.matches.length - 1;
+    }
 
+    function updateUI() {
+      const match = state.matches[state.currentMatchIndex];
+      if (!match) return;
+
+      const completedCount = state.matches.filter(m => m.winner).length;
+      const totalMatches = state.matches.length;
       document.getElementById('progress').textContent =
-        `Match ${t.currentMatchIndex + 1}/${t.totalMatches}`;
+        `Match ${completedCount + 1}/${totalMatches}`;
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
-      imgA.src = '/api/images/' + m.imageA;
-      imgB.src = '/api/images/' + m.imageB;
+      imgA.src = '/api/images/' + encodeURIComponent(match.imageA);
+      imgB.src = '/api/images/' + encodeURIComponent(match.imageB);
 
-      document.getElementById('undo-btn').disabled =
-        t.status === 'COMPLETE' || !t.lastMatchId;
+      document.getElementById('undo-btn').disabled = !match.winner;
+
+      if (state.matches.every(m => m.winner)) {
+        document.getElementById('match').style.display = 'none';
+        document.getElementById('chrome').style.display = 'none';
+        document.getElementById('results').style.display = 'flex';
+      }
     }
 
-    async function vote(winnerPath) {
-      if (state.disabled || !state.currentMatch) return;
+    function vote(winnerPath) {
+      if (state.disabled) return;
       state.disabled = true;
 
-      const el = winnerPath === state.currentMatch.imageA
-        ? document.getElementById('choice-a')
-        : document.getElementById('choice-b');
-      el.classList.add('pulse');
+      // Optimistic local update — instant, no waiting
+      state.matches[state.currentMatchIndex].winner = winnerPath;
+      const prevIndex = state.currentMatchIndex;
+      state.currentMatchIndex = findCurrentMatchIndex();
+      updateUI();
+      prefetchNextMatch();
 
-      try {
-        const result = await api(`/api/match/${state.currentMatch.id}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ winner: winnerPath }),
-        });
-        if (result.tournament && result.tournament.status === 'COMPLETE') {
-          document.getElementById('match').style.display = 'none';
-          document.getElementById('chrome').style.display = 'none';
-          document.getElementById('results').style.display = 'flex';
-        } else {
-          // Prefetch next match images immediately after vote response
-          // so they're in browser HTTP cache by the time user clicks again
-          const nextMatch = result.tournament && result.tournament.currentMatch;
-          if (nextMatch) {
-            const preloadA = new Image();
-            const preloadB = new Image();
-            preloadA.src = '/api/images/' + nextMatch.imageA;
-            preloadB.src = '/api/images/' + nextMatch.imageB;
-          }
-          state.tournament = result.tournament;
-          state.currentMatch = nextMatch;
-          updateUI();
-        }
-      } catch (e) {
-        console.error(e);
-      } finally {
-        state.disabled = false;
-        el.classList.remove('pulse');
+      // Fire-and-forget persistence
+      const matchId = state.matches[prevIndex].id;
+      fetch('/api/match/' + matchId + '/vote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ winner: winnerPath }),
+      }).catch(e => console.error(e));
+
+      state.disabled = false;
+    }
+
+    function prefetchNextMatch() {
+      const nextIndex = findCurrentMatchIndex();
+      if (nextIndex < state.matches.length) {
+        const next = state.matches[nextIndex];
+        const preloadA = new Image();
+        const preloadB = new Image();
+        preloadA.src = '/api/images/' + encodeURIComponent(next.imageA);
+        preloadB.src = '/api/images/' + encodeURIComponent(next.imageB);
       }
     }
 
     async function undo() {
       if (!state.uuid) return;
+      const lastCompleted = state.matches.filter(m => m.winner).pop();
+      if (!lastCompleted) return;
+
+      state.disabled = true;
       try {
         const result = await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
-        state.tournament = result;
-        state.currentMatch = result.currentMatch;
+        state.matches = result.matches || [];
+        state.currentMatchIndex = findCurrentMatchIndex();
         updateUI();
       } catch (e) {
         console.error(e);
+      } finally {
+        state.disabled = false;
       }
     }
 
     document.getElementById('choice-a').addEventListener('click', () => {
-      if (!state.currentMatch || state.disabled) return;
-      vote(state.currentMatch.imageA);
+      const match = state.matches[state.currentMatchIndex];
+      if (!match || state.disabled) return;
+      vote(match.imageA);
     });
     document.getElementById('choice-b').addEventListener('click', () => {
-      if (!state.currentMatch || state.disabled) return;
-      vote(state.currentMatch.imageB);
+      const match = state.matches[state.currentMatchIndex];
+      if (!match || state.disabled) return;
+      vote(match.imageB);
     });
     document.getElementById('undo-btn').addEventListener('click', undo);
     document.getElementById('download-btn').addEventListener('click', () => {

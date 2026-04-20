@@ -287,9 +287,13 @@ async def create_round_matches(
     round_number: int,
     survivors: list[str],
     total_rounds: int,
+    seed: int | None = None,
 ) -> None:
     shuffled = list(survivors)
-    random.SystemRandom().shuffle(shuffled)
+    if seed is not None:
+        random.Random(seed).shuffle(shuffled)
+    else:
+        random.SystemRandom().shuffle(shuffled)
 
     if len(shuffled) % 2 == 1:
         bye_image = shuffled.pop()
@@ -441,6 +445,21 @@ async def build_tournament_state_with_matches(
         "lastMatchId": row["last_match_id"],
         "currentMatch": serialize_match(current_match_row),
         "nextMatch": serialize_match(next_match_row),
+        "matches": [
+            serialize_match(m) for m in await fetchall(
+                db,
+                "SELECT * FROM matches WHERE tournament_id = ? ORDER BY id",
+                (tournament_uuid,),
+            )
+        ],
+        "images": [
+            {"path": i["image_path"], "roundReached": i["round_reached"], "wins": i["wins"]}
+            for i in await fetchall(
+                db,
+                "SELECT image_path, round_reached, wins FROM images WHERE tournament_id = ?",
+                (tournament_uuid,),
+            )
+        ],
     }
 
 
@@ -491,7 +510,14 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
                 (total_rounds, utc_now(), tournament_uuid),
             )
         else:
-            await create_round_matches(db, tournament_uuid, 1, image_paths, total_rounds)
+            # Pre-generate all rounds using seeded PRNG for deterministic bracket
+            rng_seed = int(tournament_uuid.replace("-", ""), 16)
+            for round_num in range(1, total_rounds + 1):
+                # Round 1 survivors = images with round_reached=0; subsequent rounds use round_reached=round_num-1
+                survivors = await collect_round_survivors(db, tournament_uuid, round_num - 1)
+                if len(survivors) <= 1:
+                    break
+                await create_round_matches(db, tournament_uuid, round_num, survivors, total_rounds, rng_seed + round_num)
 
         await db.commit()
         LOGGER.info("Created tournament %s with %s images", tournament_uuid, total_images)
@@ -877,6 +903,109 @@ async def record_match_result(request: Request) -> Response:
             await db.close()
 
 
+async def vote_match(request: Request) -> Response:
+    """
+    Fire-and-forget vote endpoint. Records winner, updates scores, returns immediately.
+    Does NOT recompute bracket or generate new rounds — all rounds are pre-generated.
+    """
+    match_id = int(request.path_params["match_id"])
+    payload = await request.json()
+    winner = payload.get("winner")
+    if not isinstance(winner, str) or not winner:
+        raise HTTPException(status_code=400, detail="winner is required")
+
+    async with app.state.lock:
+        match_row = None
+        target_db_path = None
+        active_uuid = app.state.active_uuid
+        if active_uuid:
+            active_path = db_path_for_uuid(active_uuid)
+            if active_path.exists():
+                db = await aiosqlite.connect(active_path)
+                db.row_factory = aiosqlite.Row
+                try:
+                    row = await fetchone(
+                        db,
+                        "SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path FROM matches WHERE id = ?",
+                        (match_id,),
+                    )
+                    if row:
+                        match_row = row
+                        target_db_path = active_path
+                finally:
+                    await db.close()
+        if match_row is None:
+            for path in sorted(DATA_DIR.glob("tournament_*.db")):
+                db = await aiosqlite.connect(path)
+                db.row_factory = aiosqlite.Row
+                try:
+                    row = await fetchone(
+                        db,
+                        "SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path FROM matches WHERE id = ?",
+                        (match_id,),
+                    )
+                    if row:
+                        match_row = row
+                        target_db_path = path
+                        break
+                finally:
+                    await db.close()
+
+        if match_row is None or target_db_path is None:
+            raise HTTPException(status_code=404, detail="Match not found")
+
+        db = await aiosqlite.connect(target_db_path)
+        db.row_factory = aiosqlite.Row
+        try:
+            tournament_uuid = str(match_row["tournament_id"])
+            tournament = await fetchone(
+                db,
+                "SELECT id, status, total_rounds FROM tournaments WHERE id = ?",
+                (tournament_uuid,),
+            )
+            if tournament is None or tournament["status"] != "ACTIVE":
+                raise HTTPException(status_code=409, detail="Tournament is not active")
+
+            if not winner.startswith("/"):
+                winner = f"/images/{winner}"
+            if winner not in {match_row["image_a_path"], match_row["image_b_path"]}:
+                raise HTTPException(status_code=400, detail="winner must match one of the images")
+
+            if match_row["winner_path"] is not None:
+                return JSONResponse({"received": True})
+
+            now = utc_now()
+            await db.execute(
+                "UPDATE matches SET winner_path = ?, completed_at = ? WHERE id = ?",
+                (winner, now, match_id),
+            )
+
+            image_row = await fetchone(
+                db,
+                "SELECT round_reached, wins FROM images WHERE tournament_id = ? AND image_path = ?",
+                (tournament_uuid, winner),
+            )
+            if image_row:
+                await db.execute(
+                    "UPDATE images SET wins = wins + 1 WHERE tournament_id = ? AND image_path = ?",
+                    (tournament_uuid, winner),
+                )
+                await update_image_score(
+                    db, tournament_uuid, winner,
+                    int(image_row["round_reached"]) + 1,
+                    int(tournament["total_rounds"]),
+                )
+
+            await db.execute(
+                "UPDATE tournaments SET last_match_id = ? WHERE id = ?",
+                (match_id, tournament_uuid),
+            )
+            await db.commit()
+            return JSONResponse({"received": True}, status_code=202)
+        finally:
+            await db.close()
+
+
 async def rollback_generated_future_rounds(
     db: aiosqlite.Connection,
     tournament_uuid: str,
@@ -1101,6 +1230,7 @@ routes = [
     Route("/api/tournament/{uuid}/export", export_tournament, methods=["GET"]),
     Route("/api/match/{match_id:int}", get_match, methods=["GET"]),
     Route("/api/match/{match_id:int}", record_match_result, methods=["POST"]),
+    Route("/api/match/{match_id:int}/vote", vote_match, methods=["POST"]),
     Route("/api/images/{image_path:path}", serve_image, methods=["GET"]),
 ]
 
