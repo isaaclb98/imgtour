@@ -222,6 +222,8 @@ Images are loaded directly via `img.src = '/api/images/' + imagePath` on each ma
 
 After each vote response, the next match's images are prefetched via `new Image()` so the browser HTTP cache is warm before the user clicks again. This eliminates perceptible latency on every transition after the first match.
 
+**Initialization:** On page load, if an active tournament exists, the frontend fetches `/api/tournament/{uuid}` which returns full state including `currentMatch` — no second round-trip needed. If no active tournament exists, `POST /api/tournament` creates one and returns full state inline, also skipping the second round-trip. The first images appear with just 1 HTTP request.
+
 ### Double-Click Protection
 
 **Frontend:** Both image buttons disabled immediately on first click. Re-enabled on response or timeout (5s).
