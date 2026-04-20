@@ -172,6 +172,11 @@
     <div class="spinner"></div>
   </div>
 
+  <div id="preload-pool" style="display:none">
+    <img id="preload-a" src="">
+    <img id="preload-b" src="">
+  </div>
+
   <script>
     const state = {
       uuid: null,
@@ -204,6 +209,8 @@
       const match = await api(`/api/match/${state.tournament.currentMatchId}`);
       state.currentMatch = match;
       updateUI();
+      // Preload match after next, so it's ready for the click after next
+      preloadNext();
     }
 
     function updateUI() {
@@ -216,12 +223,37 @@
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
+      const poolA = document.getElementById('preload-a');
+      const poolB = document.getElementById('preload-b');
 
-      imgA.src = '/api/images/' + m.imageA;
-      imgB.src = '/api/images/' + m.imageB;
+      // getAttribute reads the HTML attribute value — .src on an empty img
+      // returns the resolved page URL (truthy bug), getAttribute returns ""
+      const poolSrcA = poolA.getAttribute('src');
+      const poolSrcB = poolB.getAttribute('src');
+      if (poolSrcA && poolSrcB) {
+        imgA.src = poolSrcA;
+        imgB.src = poolSrcB;
+        // Clear pool after swap
+        poolA.removeAttribute('src');
+        poolB.removeAttribute('src');
+      } else {
+        imgA.src = '/api/images/' + m.imageA;
+        imgB.src = '/api/images/' + m.imageB;
+      }
 
       document.getElementById('undo-btn').disabled =
         t.status === 'COMPLETE' || !t.lastMatchId;
+    }
+
+    async function preloadNext() {
+      const t = await api(`/api/tournament/${state.uuid}`).catch(() => null);
+      if (!t || t.status !== 'ACTIVE' || !t.currentMatchId) return;
+      const m = await api(`/api/match/${t.currentMatchId}`).catch(() => null);
+      if (!m) return;
+      const poolA = document.getElementById('preload-a');
+      const poolB = document.getElementById('preload-b');
+      poolA.setAttribute('src', '/api/images/' + m.imageA);
+      poolB.setAttribute('src', '/api/images/' + m.imageB);
     }
 
     async function vote(winnerPath) {
@@ -247,6 +279,7 @@
           state.currentMatch = result.tournament && result.tournament.currentMatch;
           state.tournament = result.tournament;
           updateUI();
+          preloadNext();
         }
       } catch (e) {
         console.error(e);
@@ -260,7 +293,11 @@
       if (!state.uuid) return;
       try {
         await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
-        await loadTournament();
+        state.tournament = await api(`/api/tournament/${state.uuid}`);
+        const match = await api(`/api/match/${state.tournament.currentMatchId}`);
+        state.currentMatch = match;
+        updateUI();
+        preloadNext();
       } catch (e) {
         console.error(e);
       }
