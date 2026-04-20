@@ -177,7 +177,6 @@
       uuid: null,
       tournament: null,
       currentMatch: null,
-      nextMatch: null,   // preloaded image paths for the match after currentMatch
       disabled: false,
     };
 
@@ -204,7 +203,6 @@
       state.tournament = await api(`/api/tournament/${state.uuid}`);
       const match = await api(`/api/match/${state.tournament.currentMatchId}`);
       state.currentMatch = match;
-      state.nextMatch = null;
       updateUI();
     }
 
@@ -218,16 +216,8 @@
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
-
-      // Use preloaded next-match images if available, else load directly
-      if (state.nextMatch) {
-        imgA.src = '/api/images/' + state.nextMatch.imageA;
-        imgB.src = '/api/images/' + state.nextMatch.imageB;
-        state.nextMatch = null;
-      } else {
-        imgA.src = '/api/images/' + m.imageA;
-        imgB.src = '/api/images/' + m.imageB;
-      }
+      imgA.src = '/api/images/' + m.imageA;
+      imgB.src = '/api/images/' + m.imageB;
 
       document.getElementById('undo-btn').disabled =
         t.status === 'COMPLETE' || !t.lastMatchId;
@@ -253,16 +243,19 @@
           document.getElementById('chrome').style.display = 'none';
           document.getElementById('results').style.display = 'flex';
         } else {
-          state.tournament = result.tournament;
-          state.currentMatch = result.tournament.currentMatch;
-          // Fire-and-forget: fetch the match AFTER currentMatch and cache its images.
-          // result.tournament.currentMatchId is the ID of the new currentMatch.
-          // We store it as nextMatch so updateUI uses it on click+1.
-          if (result.tournament.currentMatchId) {
-            api(`/api/match/${result.tournament.currentMatchId}`).then(m => {
-              state.nextMatch = m;
-            }).catch(() => {});
+          // Prefetch next match images immediately after vote response
+          // so they're in browser HTTP cache by the time user clicks again
+          const nextMatch = result.tournament && result.tournament.currentMatch;
+          if (nextMatch) {
+            const preloadA = new Image();
+            const preloadB = new Image();
+            preloadA.src = '/api/images/' + nextMatch.imageA;
+            preloadB.src = '/api/images/' + nextMatch.imageB;
+            preloadA = null;
+            preloadB = null;
           }
+          state.tournament = result.tournament;
+          state.currentMatch = nextMatch;
           updateUI();
         }
       } catch (e) {
