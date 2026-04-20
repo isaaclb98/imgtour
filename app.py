@@ -305,12 +305,17 @@ async def get_current_match_row(db: aiosqlite.Connection, tournament_uuid: str, 
 def serialize_match(row: aiosqlite.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
+    # Strip /images/ prefix so frontend can use directly in /api/images/{path}
+    def rel(path: str) -> str:
+        prefix = "/images/"
+        return path[len(prefix):] if path.startswith(prefix) else path
+
     return {
         "id": row["id"],
         "tournamentId": row["tournament_id"],
         "round": row["round"],
-        "imageA": row["image_a_path"],
-        "imageB": row["image_b_path"],
+        "imageA": rel(row["image_a_path"]),
+        "imageB": rel(row["image_b_path"]),
         "winner": row["winner_path"],
         "completedAt": row["completed_at"],
     }
@@ -683,6 +688,9 @@ async def record_match_result(request: Request) -> Response:
             if tournament["status"] != "ACTIVE":
                 raise HTTPException(status_code=409, detail="Tournament is complete")
 
+            # Normalize winner to full path — frontend sends relative (photo.jpg) but DB stores full (/images/photo.jpg)
+            if not winner.startswith("/"):
+                winner = f"/images/{winner}"
             if winner not in {match_row["image_a_path"], match_row["image_b_path"]}:
                 raise HTTPException(status_code=400, detail="winner must match one of the images")
 
@@ -966,7 +974,8 @@ async def serve_image(request: Request) -> Response:
     raw_path = request.path_params["image_path"]
     image_path = Path(raw_path)
     if not image_path.is_absolute():
-        image_path = Path("/") / raw_path.lstrip("/")
+        # Relative path — prepend the first image root (e.g. /images from IMAGE_FOLDERS=/images)
+        image_path = app.state.image_roots[0] / raw_path.lstrip("/")
 
     resolved = image_path.resolve(strict=False)
     if not is_within_roots(resolved, app.state.image_roots):
