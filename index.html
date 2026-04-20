@@ -212,7 +212,8 @@
       imgA.src = '/api/images/' + encodeURIComponent(match.imageA);
       imgB.src = '/api/images/' + encodeURIComponent(match.imageB);
 
-      document.getElementById('undo-btn').disabled = !match.winner;
+      const hasPrevWinner = state.matches.slice(0, state.currentMatchIndex).some(m => m.winner);
+      document.getElementById('undo-btn').disabled = !hasPrevWinner;
 
       if (state.matches.every(m => m.winner)) {
         document.getElementById('match').style.display = 'none';
