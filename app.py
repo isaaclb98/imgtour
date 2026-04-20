@@ -6,6 +6,7 @@ import math
 import os
 import random
 import re
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -40,6 +41,8 @@ IMAGE_EXTENSIONS = {
 LOGGER = logging.getLogger("imgtour")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
+EXPORT_FOLDER = os.getenv("EXPORT_FOLDER", "").strip()
+
 # Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
 _UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I
@@ -66,6 +69,45 @@ def compute_score(round_reached: int, total_rounds: int) -> float:
     if total_rounds <= 0:
         return 0.0
     return round(round_reached / total_rounds, 3)
+
+
+async def copy_scored_images(tournament_uuid: str) -> None:
+    """
+    After tournament completion, copy all scored images to EXPORT_FOLDER
+    with score prefix in filename. Overwrites existing files.
+    """
+    if not EXPORT_FOLDER:
+        return
+
+    export_path = Path(EXPORT_FOLDER).resolve()
+    if not export_path.exists():
+        LOGGER.warning("EXPORT_FOLDER does not exist: %s", export_path)
+        return
+
+    async with open_db(tournament_uuid) as db:
+        image_rows = await fetchall(
+            db,
+            """
+            SELECT image_path, score
+            FROM images
+            WHERE tournament_id = ?
+            ORDER BY score DESC, image_path ASC
+            """,
+            (tournament_uuid,),
+        )
+
+    for row in image_rows:
+        src = Path(row["image_path"])
+        if not src.exists():
+            LOGGER.warning("Source image missing for copy: %s", src)
+            continue
+
+        score_str = f"{row['score']:.3f}"
+        dest_name = f"{score_str}_{src.name}"
+        dest = export_path / dest_name
+
+        await asyncio.to_thread(shutil.copy2, src, dest)
+        LOGGER.info("Exported: %s -> %s", src.name, dest_name)
 
 
 def parse_image_folders() -> list[Path]:
@@ -754,6 +796,8 @@ async def record_match_result(request: Request) -> Response:
                         """,
                         (round_number, utc_now(), tournament_uuid),
                     )
+                    await db.commit()
+                    asyncio.create_task(copy_scored_images(tournament_uuid))
                 else:
                     next_round = round_number + 1
                     await db.execute(

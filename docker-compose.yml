@@ -6,5 +6,7 @@ services:
     volumes:
       - ./data:/data
       - /path/to/images:/images:ro
+      - ./export:/export:rw
     environment:
       - IMAGE_FOLDERS=/images
+      - EXPORT_FOLDER=/export
