@@ -268,11 +268,9 @@ async def update_image_score(
     tournament_uuid: str,
     image_path: str,
     round_reached: int,
+    total_rounds: int,
 ) -> None:
-    tournament = await fetchone(db, "SELECT total_rounds FROM tournaments WHERE id = ?", (tournament_uuid,))
-    if tournament is None:
-        raise HTTPException(status_code=404, detail="Tournament not found")
-    score = compute_score(round_reached, int(tournament["total_rounds"]))
+    score = compute_score(round_reached, total_rounds)
     await db.execute(
         """
         UPDATE images
@@ -288,6 +286,7 @@ async def create_round_matches(
     tournament_uuid: str,
     round_number: int,
     survivors: list[str],
+    total_rounds: int,
 ) -> None:
     shuffled = list(survivors)
     random.SystemRandom().shuffle(shuffled)
@@ -301,7 +300,7 @@ async def create_round_matches(
         )
         if image_row is None:
             raise HTTPException(status_code=500, detail="Image record missing for bye")
-        await update_image_score(db, tournament_uuid, bye_image, int(image_row["round_reached"]) + 1)
+        await update_image_score(db, tournament_uuid, bye_image, int(image_row["round_reached"]) + 1, total_rounds)
 
     for index in range(0, len(shuffled), 2):
         await db.execute(
@@ -364,54 +363,84 @@ def serialize_match(row: aiosqlite.Row | None) -> dict[str, Any] | None:
     }
 
 
-async def build_tournament_state(db: aiosqlite.Connection, tournament_uuid: str) -> dict[str, Any]:
-    tournament = await fetchone(
+async def build_tournament_state(
+    db: aiosqlite.Connection,
+    tournament_uuid: str,
+) -> dict[str, Any]:
+    """
+    Standard version: fetches current and next match rows inline.
+    Use build_tournament_state_with_matches when you already have those rows.
+    """
+    current_round_row = await fetchone(
+        db, "SELECT current_round FROM tournaments WHERE id = ?", (tournament_uuid,)
+    )
+    current_round = int(current_round_row["current_round"]) if current_round_row else None
+
+    current_match_row = await get_current_match_row(db, tournament_uuid, current_round)
+    next_match_row = None
+    if current_round is not None:
+        next_match_row = await fetchone(
+            db,
+            """
+            SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+            FROM matches
+            WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
+            ORDER BY id
+            LIMIT 1
+            """,
+            (tournament_uuid, current_round + 1),
+        )
+    return await build_tournament_state_with_matches(
+        db, tournament_uuid, current_match_row, next_match_row
+    )
+
+
+async def build_tournament_state_with_matches(
+    db: aiosqlite.Connection,
+    tournament_uuid: str,
+    current_match_row: aiosqlite.Row | None,
+    next_match_row: aiosqlite.Row | None,
+) -> dict[str, Any]:
+    row = await fetchone(
         db,
         """
-        SELECT id, status, total_images, total_rounds, current_round, last_match_id
+        SELECT
+            id, status, total_images, total_rounds,
+            current_round, last_match_id,
+            (SELECT COUNT(*) FROM matches m
+             WHERE m.tournament_id = ? AND m.winner_path IS NOT NULL) AS completed_count
         FROM tournaments
         WHERE id = ?
         """,
-        (tournament_uuid,),
+        (tournament_uuid, tournament_uuid),
     )
-    if tournament is None:
+    if row is None:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
-    completed_row = await fetchone(
-        db,
-        "SELECT COUNT(*) AS count FROM matches WHERE tournament_id = ? AND winner_path IS NOT NULL",
-        (tournament_uuid,),
-    )
-    completed_matches = int(completed_row["count"]) if completed_row else 0
-
-    total_matches = max(int(tournament["total_images"]) - 1, 0)
-    current_round = int(tournament["current_round"])
-    current_match = None
-    current_match_id = None
-
-    if tournament["status"] == "ACTIVE":
-        current_match_row = await get_current_match_row(db, tournament_uuid, current_round)
-        current_match = serialize_match(current_match_row)
-        current_match_id = current_match["id"] if current_match else None
+    completed_matches = int(row["completed_count"])
+    total_images = int(row["total_images"])
+    total_matches = max(total_images - 1, 0)
+    status = row["status"]
 
     if total_matches == 0:
         current_match_index = 0
-    elif tournament["status"] == "COMPLETE":
+    elif status == "COMPLETE":
         current_match_index = total_matches
     else:
         current_match_index = completed_matches
 
     return {
-        "uuid": tournament["id"],
-        "status": tournament["status"],
-        "totalImages": tournament["total_images"],
-        "totalRounds": tournament["total_rounds"],
+        "uuid": row["id"],
+        "status": status,
+        "totalImages": total_images,
+        "totalRounds": int(row["total_rounds"]),
         "totalMatches": total_matches,
-        "currentRound": tournament["current_round"],
+        "currentRound": int(row["current_round"]),
         "currentMatchIndex": current_match_index,
-        "currentMatchId": current_match_id,
-        "lastMatchId": tournament["last_match_id"],
-        "currentMatch": current_match,
+        "currentMatchId": current_match_row["id"] if current_match_row else None,
+        "lastMatchId": row["last_match_id"],
+        "currentMatch": serialize_match(current_match_row),
+        "nextMatch": serialize_match(next_match_row),
     }
 
 
@@ -462,7 +491,7 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
                 (total_rounds, utc_now(), tournament_uuid),
             )
         else:
-            await create_round_matches(db, tournament_uuid, 1, image_paths)
+            await create_round_matches(db, tournament_uuid, 1, image_paths, total_rounds)
 
         await db.commit()
         LOGGER.info("Created tournament %s with %s images", tournament_uuid, total_images)
@@ -598,6 +627,7 @@ async def create_tournament(_: Request) -> Response:
     if not tournament_uuid:
         raise HTTPException(status_code=400, detail="No valid images found in IMAGE_FOLDERS")
 
+    # Return full tournament state inline so frontend can skip the follow-up GET
     async with open_db(tournament_uuid) as db:
         state = await build_tournament_state(db, tournament_uuid)
     return JSONResponse(state, status_code=201)
@@ -772,7 +802,7 @@ async def record_match_result(request: Request) -> Response:
                 """,
                 (tournament_uuid, winner),
             )
-            await update_image_score(db, tournament_uuid, winner, int(image_row["round_reached"]) + 1)
+            await update_image_score(db, tournament_uuid, winner, int(image_row["round_reached"]) + 1, int(tournament["total_rounds"]))
 
             await db.execute(
                 "UPDATE tournaments SET last_match_id = ? WHERE id = ?",
@@ -810,21 +840,37 @@ async def record_match_result(request: Request) -> Response:
                         "UPDATE tournaments SET current_round = ? WHERE id = ?",
                         (next_round, tournament_uuid),
                     )
-                    await create_round_matches(db, tournament_uuid, next_round, survivors)
+                    await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
 
             await db.commit()
-            fresh_match = await fetchone(
+            current_round = int(match_row["round"])
+            new_current_match = await fetchone(
                 db,
                 """
                 SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
                 FROM matches
-                WHERE id = ?
+                WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
+                ORDER BY id
+                LIMIT 1
                 """,
-                (match_id,),
+                (tournament_uuid, current_round),
             )
-            state = await build_tournament_state(db, tournament_uuid)
+            new_next_match = await fetchone(
+                db,
+                """
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                FROM matches
+                WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
+                ORDER BY id
+                LIMIT 1
+                """,
+                (tournament_uuid, current_round + 1),
+            )
+            state = await build_tournament_state_with_matches(
+                db, tournament_uuid, new_current_match, new_next_match
+            )
             app.state.active_uuid = tournament_uuid if state["status"] == "ACTIVE" else None
-            return JSONResponse({"match": serialize_match(fresh_match), "tournament": state})
+            return JSONResponse({"match": serialize_match(new_current_match), "tournament": state})
         finally:
             await db.close()
 
@@ -833,6 +879,7 @@ async def rollback_generated_future_rounds(
     db: aiosqlite.Connection,
     tournament_uuid: str,
     from_round_exclusive: int,
+    total_rounds: int,
 ) -> None:
     future_rounds = await fetchall(
         db,
@@ -867,6 +914,7 @@ async def rollback_generated_future_rounds(
                 tournament_uuid,
                 str(bye_row["image_path"]),
                 max(int(bye_row["round_reached"]) - 1, 0),
+                total_rounds,
             )
 
         await db.execute(
@@ -883,7 +931,7 @@ async def undo_last_match(request: Request) -> Response:
             tournament = await fetchone(
                 db,
                 """
-                SELECT id, status, current_round, last_match_id
+                SELECT id, status, current_round, last_match_id, total_rounds
                 FROM tournaments
                 WHERE id = ?
                 """,
@@ -908,8 +956,9 @@ async def undo_last_match(request: Request) -> Response:
 
             undone_round = int(last_match["round"])
             winner_path = str(last_match["winner_path"])
+            total_rounds = int(tournament["total_rounds"])
 
-            await rollback_generated_future_rounds(db, tournament_uuid, undone_round)
+            await rollback_generated_future_rounds(db, tournament_uuid, undone_round, total_rounds)
 
             winner_image = await fetchone(
                 db,

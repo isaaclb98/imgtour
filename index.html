@@ -191,19 +191,17 @@
       const list = await api('/api/tournament').catch(() => null);
       if (list && list.active_uuid) {
         state.uuid = list.active_uuid;
+        state.tournament = await api(`/api/tournament/${state.uuid}`);
+        state.currentMatch = state.tournament.currentMatch;
       } else {
+        // POST returns full tournament state with uuid + currentMatch — no follow-up GET needed
         const created = await api('/api/tournament', { method: 'POST' });
         state.uuid = created.uuid;
+        state.tournament = created;
+        state.currentMatch = created.currentMatch;
       }
-      await loadTournament();
-      document.getElementById('loading').classList.remove('active');
-    }
-
-    async function loadTournament() {
-      state.tournament = await api(`/api/tournament/${state.uuid}`);
-      const match = await api(`/api/match/${state.tournament.currentMatchId}`);
-      state.currentMatch = match;
       updateUI();
+      document.getElementById('loading').classList.remove('active');
     }
 
     function updateUI() {
