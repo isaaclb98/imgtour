@@ -172,11 +172,6 @@
     <div class="spinner"></div>
   </div>
 
-  <div id="preload-pool" style="display:none">
-    <img id="preload-a" src="">
-    <img id="preload-b" src="">
-  </div>
-
   <script>
     const state = {
       uuid: null,
@@ -192,6 +187,7 @@
     }
 
     async function init() {
+      document.getElementById('loading').classList.add('active');
       const list = await api('/api/tournament').catch(() => null);
       if (list && list.active_uuid) {
         state.uuid = list.active_uuid;
@@ -200,6 +196,7 @@
         state.uuid = created.uuid;
       }
       await loadTournament();
+      document.getElementById('loading').classList.remove('active');
     }
 
     async function loadTournament() {
@@ -207,7 +204,6 @@
       const match = await api(`/api/match/${state.tournament.currentMatchId}`);
       state.currentMatch = match;
       updateUI();
-      preloadNext();
     }
 
     function updateUI() {
@@ -220,30 +216,12 @@
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
-      const preloadA = document.getElementById('preload-a');
-      const preloadB = document.getElementById('preload-b');
 
-      if (preloadA.src && preloadA.complete) {
-        imgA.src = preloadA.src;
-        imgB.src = preloadB.src;
-        preloadA.removeAttribute('src');
-        preloadB.removeAttribute('src');
-      } else {
-        imgA.src = `/api/images/${m.imageA}`;
-        imgB.src = `/api/images/${m.imageB}`;
-      }
+      imgA.src = '/api/images/' + m.imageA;
+      imgB.src = '/api/images/' + m.imageB;
 
       document.getElementById('undo-btn').disabled =
         t.status === 'COMPLETE' || !t.lastMatchId;
-    }
-
-    async function preloadNext() {
-      const t = await api(`/api/tournament/${state.uuid}`).catch(() => null);
-      if (!t || t.status === 'COMPLETE') return;
-      const m = await api(`/api/match/${t.currentMatchId}`).catch(() => null);
-      if (!m) return;
-      document.getElementById('preload-a').src = `/api/images/${m.imageA}`;
-      document.getElementById('preload-b').src = `/api/images/${m.imageB}`;
     }
 
     async function vote(winnerPath) {
@@ -269,7 +247,6 @@
           state.currentMatch = result.tournament && result.tournament.currentMatch;
           state.tournament = result.tournament;
           updateUI();
-          preloadNext();
         }
       } catch (e) {
         console.error(e);
@@ -307,9 +284,7 @@
     // click event fired, causing all votes to be blocked permanently
 
     document.getElementById('loading').classList.add('active');
-    init().catch(e => console.error(e)).finally(() => {
-      document.getElementById('loading').classList.remove('active');
-    });
+    init().catch(e => console.error(e));
   </script>
 </body>
 </html>
