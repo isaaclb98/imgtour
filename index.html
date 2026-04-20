@@ -172,16 +172,12 @@
     <div class="spinner"></div>
   </div>
 
-  <div id="preload-pool" style="display:none">
-    <img id="preload-a" src="">
-    <img id="preload-b" src="">
-  </div>
-
   <script>
     const state = {
       uuid: null,
       tournament: null,
       currentMatch: null,
+      nextMatch: null,   // preloaded image paths for the match after currentMatch
       disabled: false,
     };
 
@@ -208,9 +204,8 @@
       state.tournament = await api(`/api/tournament/${state.uuid}`);
       const match = await api(`/api/match/${state.tournament.currentMatchId}`);
       state.currentMatch = match;
+      state.nextMatch = null;
       updateUI();
-      // Preload match after next, so it's ready for the click after next
-      preloadNext();
     }
 
     function updateUI() {
@@ -223,19 +218,12 @@
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
-      const poolA = document.getElementById('preload-a');
-      const poolB = document.getElementById('preload-b');
 
-      // getAttribute reads the HTML attribute value — .src on an empty img
-      // returns the resolved page URL (truthy bug), getAttribute returns ""
-      const poolSrcA = poolA.getAttribute('src');
-      const poolSrcB = poolB.getAttribute('src');
-      if (poolSrcA && poolSrcB) {
-        imgA.src = poolSrcA;
-        imgB.src = poolSrcB;
-        // Clear pool after swap
-        poolA.removeAttribute('src');
-        poolB.removeAttribute('src');
+      // Use preloaded next-match images if available, else load directly
+      if (state.nextMatch) {
+        imgA.src = '/api/images/' + state.nextMatch.imageA;
+        imgB.src = '/api/images/' + state.nextMatch.imageB;
+        state.nextMatch = null;
       } else {
         imgA.src = '/api/images/' + m.imageA;
         imgB.src = '/api/images/' + m.imageB;
@@ -243,17 +231,6 @@
 
       document.getElementById('undo-btn').disabled =
         t.status === 'COMPLETE' || !t.lastMatchId;
-    }
-
-    async function preloadNext() {
-      const t = await api(`/api/tournament/${state.uuid}`).catch(() => null);
-      if (!t || t.status !== 'ACTIVE' || !t.currentMatchId) return;
-      const m = await api(`/api/match/${t.currentMatchId}`).catch(() => null);
-      if (!m) return;
-      const poolA = document.getElementById('preload-a');
-      const poolB = document.getElementById('preload-b');
-      poolA.setAttribute('src', '/api/images/' + m.imageA);
-      poolB.setAttribute('src', '/api/images/' + m.imageB);
     }
 
     async function vote(winnerPath) {
@@ -276,10 +253,17 @@
           document.getElementById('chrome').style.display = 'none';
           document.getElementById('results').style.display = 'flex';
         } else {
-          state.currentMatch = result.tournament && result.tournament.currentMatch;
           state.tournament = result.tournament;
+          state.currentMatch = result.tournament.currentMatch;
+          // Fire-and-forget: fetch the match AFTER currentMatch and cache its images.
+          // result.tournament.currentMatchId is the ID of the new currentMatch.
+          // We store it as nextMatch so updateUI uses it on click+1.
+          if (result.tournament.currentMatchId) {
+            api(`/api/match/${result.tournament.currentMatchId}`).then(m => {
+              state.nextMatch = m;
+            }).catch(() => {});
+          }
           updateUI();
-          preloadNext();
         }
       } catch (e) {
         console.error(e);
@@ -293,11 +277,7 @@
       if (!state.uuid) return;
       try {
         await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
-        state.tournament = await api(`/api/tournament/${state.uuid}`);
-        const match = await api(`/api/match/${state.tournament.currentMatchId}`);
-        state.currentMatch = match;
-        updateUI();
-        preloadNext();
+        await loadTournament();
       } catch (e) {
         console.error(e);
       }
@@ -315,10 +295,6 @@
     document.getElementById('download-btn').addEventListener('click', () => {
       window.location.href = `/api/tournament/${state.uuid}/export`;
     });
-
-    // double-click protection — vote() sets state.disabled at start and clears in finally;
-    // the pointerdown handler is removed because it was setting state.disabled before the
-    // click event fired, causing all votes to be blocked permanently
 
     document.getElementById('loading').classList.add('active');
     init().catch(e => console.error(e));
