@@ -505,20 +505,20 @@ async def list_tournaments_metadata() -> list[dict[str, Any]]:
     return tournaments
 
 
-async def startup_task() -> None:
+async def lifespan(app):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     active_uuid = await find_active_tournament_uuid()
     if active_uuid:
         app.state.active_uuid = active_uuid
         LOGGER.info("Resuming active tournament %s", active_uuid)
-        return
-
-    created_uuid = await create_tournament_from_folders(app.state.image_roots)
-    app.state.active_uuid = created_uuid
-    if created_uuid:
-        LOGGER.info("Started new tournament %s on startup", created_uuid)
     else:
-        LOGGER.info("No tournament created on startup")
+        created_uuid = await create_tournament_from_folders(app.state.image_roots)
+        app.state.active_uuid = created_uuid
+        if created_uuid:
+            LOGGER.info("Started new tournament %s on startup", created_uuid)
+        else:
+            LOGGER.info("No tournament created on startup")
+    yield
 
 
 async def homepage(_: Request) -> Response:
@@ -994,8 +994,7 @@ routes = [
     Route("/api/images/{image_path:path}", serve_image, methods=["GET"]),
 ]
 
-app = Starlette(routes=routes)
+app = Starlette(routes=routes, lifespan=lifespan)
 app.state.image_roots = parse_image_folders()
 app.state.active_uuid = None
 app.state.lock = asyncio.Lock()
-app.add_event_handler("startup", startup_task)
