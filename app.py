@@ -399,7 +399,7 @@ async def build_tournament_state(db: aiosqlite.Connection, tournament_uuid: str)
     elif tournament["status"] == "COMPLETE":
         current_match_index = total_matches
     else:
-        current_match_index = min(completed_matches + 1, total_matches)
+        current_match_index = completed_matches
 
     return {
         "uuid": tournament["id"],
