@@ -25,6 +25,7 @@ docker run -d \
   -v "$(pwd)/export:/export:rw" \
   -e IMAGE_FOLDERS=/images \
   -e EXPORT_FOLDER=/export \
+  -e RESET=1 \
   --restart unless-stopped \
   "$IMAGE_NAME"
 

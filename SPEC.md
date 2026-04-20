@@ -267,6 +267,7 @@ Environment variables:
 - `IMAGE_FOLDERS` — colon-separated list of image directory paths (default: `/images`)
 - `DATA_DIR` — where to store tournament DBs (default: `/data`)
 - `EXPORT_FOLDER` — if set, tournament completion triggers copy of all scored images to this folder with `{score}_{filename}` prefix, overwriting existing files (default: none — feature disabled)
+- `RESET` — if set to `1` or `true`, wipes all existing tournament databases in DATA_DIR on startup before resuming or creating a tournament (default: none — feature disabled)
 
 No config file. All runtime config via env vars.
 

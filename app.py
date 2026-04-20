@@ -42,6 +42,7 @@ LOGGER = logging.getLogger("imgtour")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 EXPORT_FOLDER = os.getenv("EXPORT_FOLDER", "").strip()
+RESET = os.getenv("RESET", "").strip().lower() in ("1", "true")
 
 # Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
 _UUID4_RE = re.compile(
@@ -554,6 +555,11 @@ async def list_tournaments_metadata() -> list[dict[str, Any]]:
 
 async def lifespan(app):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if RESET:
+        before = len(list(DATA_DIR.glob("tournament_*.db")))
+        for db_path in DATA_DIR.glob("tournament_*.db"):
+            db_path.unlink(missing_ok=True)
+        LOGGER.info("RESET enabled — cleared %s tournament DBs", before)
     active_uuid = await find_active_tournament_uuid()
     if active_uuid:
         app.state.active_uuid = active_uuid
