@@ -268,7 +268,9 @@
       if (!state.uuid) return;
       try {
         await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
-        await loadTournament();
+        state.tournament = await api(`/api/tournament/${state.uuid}`);
+        state.currentMatch = state.tournament.currentMatch;
+        updateUI();
       } catch (e) {
         console.error(e);
       }
