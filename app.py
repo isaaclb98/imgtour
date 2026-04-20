@@ -843,7 +843,9 @@ async def record_match_result(request: Request) -> Response:
                     await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
 
             await db.commit()
-            current_round = int(match_row["round"])
+            # Re-fetch current_round from DB — it was updated when the round advanced
+            t_row = await fetchone(db, "SELECT current_round FROM tournaments WHERE id = ?", (tournament_uuid,))
+            current_round = int(t_row["current_round"])
             new_current_match = await fetchone(
                 db,
                 """

@@ -249,8 +249,6 @@
             const preloadB = new Image();
             preloadA.src = '/api/images/' + nextMatch.imageA;
             preloadB.src = '/api/images/' + nextMatch.imageB;
-            preloadA = null;
-            preloadB = null;
           }
           state.tournament = result.tournament;
           state.currentMatch = nextMatch;
@@ -267,9 +265,9 @@
     async function undo() {
       if (!state.uuid) return;
       try {
-        await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
-        state.tournament = await api(`/api/tournament/${state.uuid}`);
-        state.currentMatch = state.tournament.currentMatch;
+        const result = await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
+        state.tournament = result;
+        state.currentMatch = result.currentMatch;
         updateUI();
       } catch (e) {
         console.error(e);
