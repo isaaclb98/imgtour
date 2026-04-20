@@ -201,29 +201,15 @@ services:
 
 Single page at `/` that:
 1. Loads and shows current match (two images, click to select winner)
-2. Preloads next match's images in background (hidden img tags)
-3. On selection: POST result, receive next match, update display
-4. On tournament complete: show results summary + download CSV button
-5. "Undo" button to reverse the last match (single-step)
+2. On selection: POST result, receive next match, update display
+3. On tournament complete: show results summary + download CSV button
+4. "Undo" button to reverse the last match (single-step)
 
 No framework. No build step. Pure browser JS.
 
-### Preload Strategy
+### Image Loading
 
-Always keep the next pair preloaded in a hidden div:
-```html
-<div id="preload-pool" style="display:none">
-  <img id="preload-a" src="">
-  <img id="preload-b" src="">
-</div>
-```
-
-On match resolution:
-1. Immediately swap `preload-a`/`preload-b` into visible slots (already loaded)
-2. Fire background fetch for what is now the next next pair
-3. Update preload pool with new targets
-
-Result: user never waits for an image to load after the first click. First click loads the initial pair; every subsequent click swaps preloaded images.
+Images are loaded directly via `img.src = '/api/images/' + imagePath` on each match update. The browser handles caching automatically.
 
 ### Double-Click Protection
 
