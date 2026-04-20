@@ -1112,6 +1112,7 @@ async def undo_last_match(request: Request) -> Response:
                 tournament_uuid,
                 winner_path,
                 max(int(winner_image["round_reached"]) - 1, 0),
+                total_rounds,
             )
 
             await db.execute(
