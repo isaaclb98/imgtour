@@ -12,7 +12,7 @@ services:
       - IMAGE_FOLDERS=/images
       - EXPORT_FOLDER=/export
       - SAMPLE_SIZE=0
-      - RESET=
+      - RESET=0
 
 volumes:
   imgtour_data:
