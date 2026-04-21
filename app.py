@@ -225,7 +225,46 @@ def is_within_roots(candidate: Path, roots: list[Path]) -> bool:
     return False
 
 
+_JPEG_HEADER = b"\xff\xd8\xff"
+_PNG_HEADER = b"\x89PNG"
+_WEBP_HEADER = b"RIFF"
+_GIF_HEADER = b"GIF87a"
+_TIFF_HEADERS = (b"II\x2a\x00", b"MM\x00\x2a")
+BMP_HEADER = b"BM"
+
+
+def _is_known_header(path: Path) -> bool:
+    """Lightweight check: read first 12 bytes and match known image headers."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+    except (OSError, IOError):
+        return False
+
+    if header.startswith(_JPEG_HEADER):
+        return True
+    if header.startswith(_PNG_HEADER):
+        return True
+    if header.startswith(_GIF_HEADER):
+        return True
+    if header.startswith(BMP_HEADER):
+        return True
+    if header[:4] == _WEBP_HEADER and b"WEBP" in header[8:12]:
+        return True
+    if header[:4] in _TIFF_HEADERS:
+        return True
+    # HEIC/HEIF: "ftyp" at offset 4
+    if header[4:8] == b"ftyp" and (b"heic" in header[4:12] or b"heif" in header[4:12]):
+        return True
+    return False
+
+
 def validate_image_file(path: Path) -> bool:
+    # Fast path: if extension is known and header matches, skip PIL verification
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        if _is_known_header(path):
+            return True
+    # Slow path: PIL open (catches truly corrupt files with matching extension)
     try:
         with Image.open(path) as image:
             image.verify()
