@@ -286,7 +286,7 @@ def scan_images(image_roots: list[Path]) -> tuple[list[str], str]:
         # os.walk is faster than sorted(rglob) — no stat per entry, no sort
         for dirpath, dirnames, filenames in os.walk(root):
             for filename in filenames:
-                if is_supported_extension(Path(filename)):
+                if Path(filename).suffix.lower() in IMAGE_EXTENSIONS:
                     candidates.append(Path(dirpath) / filename)
 
     # Sample first if SAMPLE_SIZE is set — skip validating 99% of files early
