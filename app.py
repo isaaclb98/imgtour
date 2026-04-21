@@ -275,29 +275,38 @@ def validate_image_file(path: Path) -> bool:
 
 
 def scan_images(image_roots: list[Path]) -> tuple[list[str], str]:
-    valid_images: list[str] = []
     used_roots: list[str] = []
+    candidates: list[Path] = []
 
     for root in image_roots:
         if not root.exists() or not root.is_dir():
             LOGGER.warning("Image folder missing or not a directory: %s", root)
             continue
         used_roots.append(str(root))
-        for file_path in sorted(root.rglob("*")):
-            if not file_path.is_file():
-                continue
-            if not is_supported_extension(file_path):
-                continue
-            if validate_image_file(file_path):
-                valid_images.append(str(file_path.resolve()))
+        # os.walk is faster than sorted(rglob) — no stat per entry, no sort
+        for dirpath, dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if is_supported_extension(Path(filename)):
+                    candidates.append(Path(dirpath) / filename)
+
+    # Sample first if SAMPLE_SIZE is set — skip validating 99% of files early
+    if SAMPLE_SIZE > 0 and SAMPLE_SIZE < len(candidates):
+        import random as random_module
+        random_module.shuffle(candidates)
+        candidates = candidates[:SAMPLE_SIZE]
+        LOGGER.info("Sampled %d candidates (sample_size=%d)", len(candidates), SAMPLE_SIZE)
+
+    valid_images: list[str] = []
+    for file_path in candidates:
+        if validate_image_file(file_path):
+            valid_images.append(str(file_path.resolve()))
 
     seen: set[str] = set()
     deduped: list[str] = []
     for image_path in valid_images:
-        if image_path in seen:
-            continue
-        seen.add(image_path)
-        deduped.append(image_path)
+        if image_path not in seen:
+            seen.add(image_path)
+            deduped.append(image_path)
 
     return deduped, ",".join(used_roots)
 
@@ -520,13 +529,7 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
         LOGGER.warning("No valid images found in IMAGE_FOLDERS")
         return None
 
-    # Randomly sample if SAMPLE_SIZE is set and greater than 0
-    if SAMPLE_SIZE > 0 and SAMPLE_SIZE < len(image_paths):
-        import random as random_module
-        random_module.shuffle(image_paths)
-        image_paths = image_paths[:SAMPLE_SIZE]
-        LOGGER.info("Sampled %d images (sample_size=%d)", len(image_paths), SAMPLE_SIZE)
-
+    # Sampling is now handled inside scan_images when SAMPLE_SIZE > 0
     tournament_uuid = str(uuid.uuid4())
     total_images = len(image_paths)
     total_rounds = compute_total_rounds(total_images)
