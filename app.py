@@ -275,29 +275,38 @@ def validate_image_file(path: Path) -> bool:
 
 
 def scan_images(image_roots: list[Path]) -> tuple[list[str], str]:
-    valid_images: list[str] = []
     used_roots: list[str] = []
+    candidates: list[Path] = []
 
     for root in image_roots:
         if not root.exists() or not root.is_dir():
             LOGGER.warning("Image folder missing or not a directory: %s", root)
             continue
         used_roots.append(str(root))
-        for file_path in sorted(root.rglob("*")):
-            if not file_path.is_file():
-                continue
-            if not is_supported_extension(file_path):
-                continue
-            if validate_image_file(file_path):
-                valid_images.append(str(file_path.resolve()))
+        # os.walk is faster than sorted(rglob) — no stat per entry, no sort
+        for dirpath, dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if Path(filename).suffix.lower() in IMAGE_EXTENSIONS:
+                    candidates.append(Path(dirpath) / filename)
+
+    # Sample first if SAMPLE_SIZE is set — skip validating 99% of files early
+    if SAMPLE_SIZE > 0 and SAMPLE_SIZE < len(candidates):
+        import random as random_module
+        random_module.shuffle(candidates)
+        candidates = candidates[:SAMPLE_SIZE]
+        LOGGER.info("Sampled %d candidates (sample_size=%d)", len(candidates), SAMPLE_SIZE)
+
+    valid_images: list[str] = []
+    for file_path in candidates:
+        if validate_image_file(file_path):
+            valid_images.append(str(file_path.resolve()))
 
     seen: set[str] = set()
     deduped: list[str] = []
     for image_path in valid_images:
-        if image_path in seen:
-            continue
-        seen.add(image_path)
-        deduped.append(image_path)
+        if image_path not in seen:
+            seen.add(image_path)
+            deduped.append(image_path)
 
     return deduped, ",".join(used_roots)
 
@@ -520,13 +529,7 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
         LOGGER.warning("No valid images found in IMAGE_FOLDERS")
         return None
 
-    # Randomly sample if SAMPLE_SIZE is set and greater than 0
-    if SAMPLE_SIZE > 0 and SAMPLE_SIZE < len(image_paths):
-        import random as random_module
-        random_module.shuffle(image_paths)
-        image_paths = image_paths[:SAMPLE_SIZE]
-        LOGGER.info("Sampled %d images (sample_size=%d)", len(image_paths), SAMPLE_SIZE)
-
+    # Sampling is now handled inside scan_images when SAMPLE_SIZE > 0
     tournament_uuid = str(uuid.uuid4())
     total_images = len(image_paths)
     total_rounds = compute_total_rounds(total_images)
@@ -962,7 +965,7 @@ async def record_match_result(request: Request) -> Response:
 async def vote_match(request: Request) -> Response:
     """
     Fire-and-forget vote endpoint. Records winner, updates scores, returns immediately.
-    Does NOT recompute bracket or generate new rounds — all rounds are pre-generated.
+    When a round completes, advances to the next round.
     """
     match_id = int(request.path_params["match_id"])
     payload = await request.json()
@@ -1056,6 +1059,40 @@ async def vote_match(request: Request) -> Response:
                 "UPDATE tournaments SET last_match_id = ? WHERE id = ?",
                 (match_id, tournament_uuid),
             )
+
+            round_number = int(match_row["round"])
+            pending_row = await fetchone(
+                db,
+                """
+                SELECT COUNT(*) AS count
+                FROM matches
+                WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
+                """,
+                (tournament_uuid, round_number),
+            )
+            pending_count = int(pending_row["count"]) if pending_row else 0
+
+            if pending_count == 0:
+                survivors = await collect_round_survivors(db, tournament_uuid, round_number)
+                if len(survivors) <= 1:
+                    await db.execute(
+                        """
+                        UPDATE tournaments
+                        SET status = 'COMPLETE', current_round = ?, completed_at = ?
+                        WHERE id = ?
+                        """,
+                        (round_number, utc_now(), tournament_uuid),
+                    )
+                    await db.commit()
+                    asyncio.create_task(copy_scored_images(tournament_uuid))
+                else:
+                    next_round = round_number + 1
+                    await db.execute(
+                        "UPDATE tournaments SET current_round = ? WHERE id = ?",
+                        (next_round, tournament_uuid),
+                    )
+                    await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
+
             await db.commit()
             return JSONResponse({"received": True}, status_code=202)
         finally:
