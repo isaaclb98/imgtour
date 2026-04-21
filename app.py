@@ -542,7 +542,13 @@ async def build_tournament_state_with_matches(
 
     completed_matches = int(row["completed_count"])
     total_images = int(row["total_images"])
-    total_matches = max(total_images - 1, 0)
+    # Use actual match count from DB (accounts for byes, which reduce total matches below N-1)
+    actual_matches_row = await fetchone(
+        db,
+        "SELECT COUNT(*) AS count FROM matches WHERE tournament_id = ?",
+        (tournament_uuid,),
+    )
+    total_matches = int(actual_matches_row[0]) if actual_matches_row else 0
     status = row["status"]
 
     if total_matches == 0:
@@ -630,14 +636,12 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
                 (total_rounds, utc_now(), tournament_uuid),
             )
         else:
-            # Pre-generate all rounds using seeded PRNG for deterministic bracket
+            # Pre-generate round 1 only; subsequent rounds are created lazily
+            # by vote_match/record_match_result when each round completes
             rng_seed = int(tournament_uuid.replace("-", ""), 16)
-            for round_num in range(1, total_rounds + 1):
-                # Round 1 survivors = images with round_reached=0; subsequent rounds use round_reached=round_num-1
-                survivors = await collect_round_survivors(db, tournament_uuid, round_num - 1)
-                if len(survivors) <= 1:
-                    break
-                await create_round_matches(db, tournament_uuid, round_num, survivors, total_rounds, rng_seed + round_num)
+            survivors = await collect_round_survivors(db, tournament_uuid, 0)
+            if len(survivors) > 1:
+                await create_round_matches(db, tournament_uuid, 1, survivors, total_rounds, rng_seed + 1)
 
         await db.commit()
         LOGGER.info("Created tournament %s with %s images", tournament_uuid, total_images)
