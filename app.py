@@ -1059,6 +1059,40 @@ async def vote_match(request: Request) -> Response:
                 "UPDATE tournaments SET last_match_id = ? WHERE id = ?",
                 (match_id, tournament_uuid),
             )
+
+            round_number = int(match_row["round"])
+            pending_row = await fetchone(
+                db,
+                """
+                SELECT COUNT(*) AS count
+                FROM matches
+                WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
+                """,
+                (tournament_uuid, round_number),
+            )
+            pending_count = int(pending_row["count"]) if pending_row else 0
+
+            if pending_count == 0:
+                survivors = await collect_round_survivors(db, tournament_uuid, round_number)
+                if len(survivors) <= 1:
+                    await db.execute(
+                        """
+                        UPDATE tournaments
+                        SET status = 'COMPLETE', current_round = ?, completed_at = ?
+                        WHERE id = ?
+                        """,
+                        (round_number, utc_now(), tournament_uuid),
+                    )
+                    await db.commit()
+                    asyncio.create_task(copy_scored_images(tournament_uuid))
+                else:
+                    next_round = round_number + 1
+                    await db.execute(
+                        "UPDATE tournaments SET current_round = ? WHERE id = ?",
+                        (next_round, tournament_uuid),
+                    )
+                    await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
+
             await db.commit()
             return JSONResponse({"received": True}, status_code=202)
         finally:
