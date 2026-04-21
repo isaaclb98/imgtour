@@ -542,13 +542,8 @@ async def build_tournament_state_with_matches(
 
     completed_matches = int(row["completed_count"])
     total_images = int(row["total_images"])
-    # Use actual match count from DB (accounts for byes, which reduce total matches below N-1)
-    actual_matches_row = await fetchone(
-        db,
-        "SELECT COUNT(*) AS count FROM matches WHERE tournament_id = ?",
-        (tournament_uuid,),
-    )
-    total_matches = int(actual_matches_row[0]) if actual_matches_row else 0
+    # Use total_images - 1 as the tournament total (not DB count, which only has current round)
+    total_matches = max(total_images - 1, 0)
     status = row["status"]
 
     if total_matches == 0:
@@ -1175,7 +1170,37 @@ async def vote_match(request: Request) -> Response:
                     await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
 
             await db.commit()
-            return JSONResponse({"received": True}, status_code=202)
+
+            # Build tournament state for the client (same pattern as record_match_result)
+            t_row = await fetchone(db, "SELECT current_round FROM tournaments WHERE id = ?", (tournament_uuid,))
+            current_round = int(t_row["current_round"])
+            new_current_match = await fetchone(
+                db,
+                """
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                FROM matches
+                WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
+                ORDER BY id
+                LIMIT 1
+                """,
+                (tournament_uuid, current_round),
+            )
+            new_next_match = await fetchone(
+                db,
+                """
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                FROM matches
+                WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
+                ORDER BY id
+                LIMIT 1
+                """,
+                (tournament_uuid, current_round + 1),
+            )
+            state = await build_tournament_state_with_matches(
+                db, tournament_uuid, new_current_match, new_next_match
+            )
+            app.state.active_uuid = tournament_uuid if state["status"] == "ACTIVE" else None
+            return JSONResponse({"received": True, "tournament": state}, status_code=202)
         finally:
             await db.close()
 
