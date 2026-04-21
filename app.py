@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import hashlib
 import io
 import logging
 import math
@@ -43,7 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 EXPORT_FOLDER = os.getenv("EXPORT_FOLDER", "").strip()
 RESET = os.getenv("RESET", "").strip().lower() in ("1", "true")
-SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "0"))  # 0 = no sampling, use all images
+SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "0") or "0")  # 0 = no sampling, use all images
 
 # Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
 _UUID4_RE = re.compile(
@@ -105,10 +106,12 @@ async def copy_scored_images(tournament_uuid: str) -> None:
             continue
 
         score_str = f"{row['score']:.3f}"
-        # Use a hash of the original path to avoid collisions when different source
-        # directories have files with the same name (e.g. /photos/vacation/img.jpg vs
-        # /photos/birthday/img.jpg). Store flat with no directory structure.
-        path_hash = format(abs(hash(row["image_path"])), "x")[:8]
+        # Use MD5 hash prefix of the original path to avoid collisions when
+        # different source directories have files with the same name (e.g.
+        # /photos/vacation/img.jpg vs /photos/birthday/img.jpg). MD5 is
+        # deterministic across processes unlike Python's hash(). Store flat
+        # with no directory structure.
+        path_hash = hashlib.md5(row["image_path"].encode()).hexdigest()[:8]
         stem = src.stem
         ext = src.suffix
         dest_name = f"{score_str}_{stem}_{path_hash}{ext}"
