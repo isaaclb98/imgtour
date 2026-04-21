@@ -288,6 +288,18 @@
       window.location.href = `/api/tournament/${state.uuid}/export`;
     });
 
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') {
+        const match = state.matches[state.currentMatchIndex];
+        if (match && !state.disabled) vote(match.imageA);
+      } else if (e.key === 'ArrowRight') {
+        const match = state.matches[state.currentMatchIndex];
+        if (match && !state.disabled) vote(match.imageB);
+      } else if (e.key === 'ArrowDown') {
+        undo();
+      }
+    });
+
     document.getElementById('loading').classList.add('active');
     init().catch(e => console.error(e));
   </script>
