@@ -965,7 +965,7 @@ async def record_match_result(request: Request) -> Response:
 async def vote_match(request: Request) -> Response:
     """
     Fire-and-forget vote endpoint. Records winner, updates scores, returns immediately.
-    Does NOT recompute bracket or generate new rounds — all rounds are pre-generated.
+    When a round completes, advances to the next round.
     """
     match_id = int(request.path_params["match_id"])
     payload = await request.json()
