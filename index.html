@@ -159,7 +159,9 @@
       matches: [],
       images: [],
       currentMatchIndex: 0,
+      totalMatches: 0,
       disabled: false,
+      pendingVote: false,
       totalRounds: 0,
     };
 
@@ -178,6 +180,7 @@
         state.matches = t.matches || [];
         state.images = t.images || [];
         state.totalRounds = t.totalRounds || 1;
+        state.totalMatches = t.totalMatches || state.matches.length;
         state.currentMatchIndex = findCurrentMatchIndex();
       } else {
         const created = await api('/api/tournament', { method: 'POST' });
@@ -185,6 +188,7 @@
         state.matches = created.matches || [];
         state.images = created.images || [];
         state.totalRounds = created.totalRounds || 1;
+        state.totalMatches = created.totalMatches || state.matches.length;
         state.currentMatchIndex = findCurrentMatchIndex();
       }
       updateUI();
@@ -203,9 +207,8 @@
       if (!match) return;
 
       const completedCount = state.matches.filter(m => m.winner).length;
-      const totalMatches = state.matches.length;
       document.getElementById('progress').textContent =
-        `Match ${completedCount + 1}/${totalMatches}`;
+        `Match ${completedCount + 1}/${state.totalMatches}`;
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
@@ -215,7 +218,8 @@
       const canUndo = completedCount > 0;
       document.getElementById('undo-btn').disabled = !canUndo;
 
-      if (state.matches.every(m => m.winner)) {
+      const complete = !state.pendingVote && state.matches.every(m => m.winner);
+      if (complete) {
         document.getElementById('match').style.display = 'none';
         document.getElementById('chrome').style.display = 'none';
         document.getElementById('results').style.display = 'flex';
@@ -225,6 +229,7 @@
     function vote(winnerPath) {
       if (state.disabled) return;
       state.disabled = true;
+      state.pendingVote = true;
 
       // Optimistic local update — instant, no waiting
       state.matches[state.currentMatchIndex].winner = winnerPath;
@@ -233,15 +238,30 @@
       updateUI();
       prefetchNextMatch();
 
-      // Fire-and-forget persistence
+      // Fire-and-forget persistence — merge returned matches to stay in sync
       const matchId = state.matches[prevIndex].id;
       fetch('/api/match/' + matchId + '/vote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ winner: winnerPath }),
-      }).catch(e => console.error(e));
-
-      state.disabled = false;
+      }).then(res => res.json()).then(data => {
+        if (data.tournament && data.tournament.matches) {
+          // Merge new matches from server (round N+1 created when round N completed)
+          const existingIds = new Set(state.matches.map(m => m.id));
+          for (const m of data.tournament.matches) {
+            if (!existingIds.has(m.id)) {
+              state.matches.push(m);
+            }
+          }
+        }
+        state.pendingVote = false;
+        state.disabled = false;
+        updateUI();
+      }).catch(e => {
+        console.error(e);
+        state.pendingVote = false;
+        state.disabled = false;
+      });
     }
 
     function prefetchNextMatch() {
