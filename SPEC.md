@@ -22,9 +22,10 @@ Example (8 images, 3 rounds):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/tournament/{uuid}` | Get current tournament state |
+| GET | `/api/tournament/{uuid}` | Get current tournament state (includes all `matches[]` and `images[]`) |
 | POST | `/api/tournament` | Create new tournament from image folder(s) |
-| POST | `/api/match/{match_id}` | Record match result `{winner: "path"}` |
+| POST | `/api/match/{match_id}` | Record match result `{winner: "path"}` (legacy, full engine) |
+| POST | `/api/match/{match_id}/vote` | Fire-and-forget vote for client-side tournament engine |
 | GET | `/api/match/{match_id}` | Get match details |
 | POST | `/api/tournament/{uuid}/undo` | Undo the last match result |
 | GET | `/api/tournament/{uuid}/export` | Download CSV results |
@@ -38,18 +39,26 @@ Example (8 images, 3 rounds):
   "status": "ACTIVE",
   "totalImages": 8,
   "totalRounds": 3,
-  "currentRound": 2,
+  "totalMatches": 7,
   "currentMatchIndex": 0,
-  "images": [...],
-  "currentMatch": {
-    "id": 5,
-    "round": 2,
-    "imageA": "/images/photo1.jpg",
-    "imageB": "/images/photo2.png",
-    "completed": false
-  }
+  "currentMatchId": 1,
+  "lastMatchId": null,
+  "currentMatch": { "id": 1, "round": 1, "imageA": "photo1.jpg", "imageB": "photo2.jpg", "winner": null },
+  "nextMatch": { "id": 2, "round": 1, "imageA": "photo3.jpg", "imageB": "photo4.jpg", "winner": null },
+  "matches": [
+    { "id": 1, "round": 1, "imageA": "photo1.jpg", "imageB": "photo2.jpg", "winner": null },
+    { "id": 2, "round": 1, "imageA": "photo3.jpg", "imageB": "photo4.jpg", "winner": null },
+    ...
+    { "id": 7, "round": 3, "imageA": "...", "imageB": "...", "winner": null }
+  ],
+  "images": [
+    { "path": "/images/photo1.jpg", "roundReached": 0, "wins": 0 },
+    ...
+  ]
 }
 ```
+
+All rounds are pre-generated at tournament creation. `matches[]` contains every match for every round. The client scans for the first `winner == null` to find the current match.
 
 ## Database Schema (SQLite)
 
@@ -97,31 +106,22 @@ CREATE INDEX idx_images_tournament ON images(tournament_id);
 
 ```
 IDLE
-  └─ POST /api/tournament → creates DB, all images inserted → GENERATE_ROUND_1
+  └─ POST /api/tournament → creates DB, all images inserted → GENERATE_ALL_ROUNDS
 
-GENERATE_ROUND_1
-  └─ Shuffle all images, pair randomly, insert matches rows → MATCH_ACTIVE
+GENERATE_ALL_ROUNDS
+  └─ Loop round 1 to total_rounds: collect survivors, shuffle with seeded PRNG, insert matches → ACTIVE
 
-MATCH_ACTIVE
-  └─ POST /api/match/{id} {winner}
-      ├─ Persist winner to matches row
-      ├─ Update winner's wins++ and round_reached++
-      ├─ Update last_match_id in tournament row
-      ├─ If all matches in round done:
-      │   ├─ If only one image remains → TOURNAMENT_COMPLETE
-      │   └─ Else: GENERATE_NEXT_ROUND
-      └─ Else: stay MATCH_ACTIVE (query next incomplete match)
-
-GENERATE_NEXT_ROUND
-  └─ Collect surviving images, shuffle, pair randomly, insert matches rows → MATCH_ACTIVE
+ACTIVE (client-side tournament engine)
+  └─ Client scans matches[] for first winner == null → displays match
+  └─ Client vote: optimistic local update, fire-and-forget POST /api/match/{id}/vote
+  └─ POST /api/match/{id}/vote: persists winner, updates winner's round_reached/wins/score
+  └─ If all matches complete → status = COMPLETE
 
 TOURNAMENT_COMPLETE
   └─ GET /api/tournament/{uuid}/export → CSV
 ```
 
-**State transitions are persisted to SQLite after every change.**
-
-**Concurrent write handling:** If two tabs submit the same match, the second submission finds `winner IS NOT NULL` and returns the next current match (idempotent). No corruption, but the second tab shows stale state. Single-user tool — acceptable for Phase 1.
+**Concurrent write handling:** If two tabs submit the same match, the second submission finds `winner IS NOT NULL` and returns 202 idempotently. No corruption, but the second tab shows stale state. Single-user tool — acceptable.
 
 ## Image Handling
 
@@ -133,42 +133,23 @@ TOURNAMENT_COMPLETE
 
 ## Bracket Generation
 
-Bracket is generated **round-by-round**, not pre-paired. Pairs are randomized each round from surviving images.
+All rounds are pre-generated at tournament creation (not lazy round-by-round). Pairs are randomized using a seeded PRNG (`random.Random(tournament_uuid + round_number)`) so the bracket is deterministic.
 
 For N images (rounds = ceil(log2(N))):
 
-1. Tournament created → all `images` rows inserted, no `matches` yet
-2. Round 1: collect all alive images, shuffle, pair randomly, create `matches` rows
-3. After round completes: collect survivors, shuffle, pair, create next round's matches
-4. Repeat until one image remains
-5. If odd count in a round, one image gets a bye (advances without a match)
+1. Tournament created → all `images` rows inserted with `round_reached=0`
+2. All rounds generated in a loop from round 1 to total_rounds:
+   - Collect survivors (images with `round_reached == round_num - 1`)
+   - Shuffle with seeded PRNG
+   - Pair randomly, insert `matches` rows
+   - For byes: pop one survivor, increment its `round_reached` directly (no match row)
+3. Repeat until one image remains or round generation produces ≤1 survivor
 
-**Round-by-round example (8 images):**
-```
-Tournament created → images [A,B,C,D,E,F,G,H] in DB, no matches
+**Deterministic seeding:** The same set of images always produces the same bracket. If the browser crashes and the user reloads, the bracket is identical.
 
-Round 1: shuffled [A,B,C,D,E,F,G,H]
-  → Match 0: A vs B
-  → Match 1: C vs D
-  → Match 2: E vs F
-  → Match 3: G vs H
-All 4 Round 1 matches complete
+**Client current-match tracking:** The client scans `matches[]` for the first entry where `winner == null`. No round counting needed.
 
-Round 2: survivors [A, C, E, H], shuffled [C,H,A,E]
-  → Match 4: C vs H
-  → Match 5: A vs E
-Both Round 2 matches complete
-
-Round 3: survivors [C, A], shuffled [C,A]
-  → Match 6: C vs A
-Match 6 complete → TOURNAMENT_COMPLETE
-```
-
-**Current match tracking:** `current_round` stored in `tournaments`. To find active match: `SELECT * FROM matches WHERE tournament_id=? AND round=? AND winner IS NULL LIMIT 1`.
-
-**Round completion:** When `SELECT COUNT(*) FROM matches WHERE tournament_id=? AND round=? AND winner IS NULL` returns 0 and `round < total_rounds`, advance `current_round` and generate next round's matches.
-
-**Bye handling:** If odd number of survivors in a round, one advances without a match. Its `round_reached` increments but no `matches` row is created for it.
+**Bye handling:** If odd number of survivors in a round, one gets a bye. No `matches` row is created for it. Its `round_reached` is incremented directly in the `images` table during bracket generation. The client sees the missing match and skips to the next round.
 
 ## Docker Setup
 
@@ -211,6 +192,10 @@ No framework. No build step. Pure browser JS.
 
 Images are loaded directly via `img.src = '/api/images/' + imagePath` on each match update. The browser handles caching automatically.
 
+After each vote response, the next match's images are prefetched via `new Image()` so the browser HTTP cache is warm before the user clicks again. This eliminates perceptible latency on every transition after the first match.
+
+**Initialization:** On page load, if an active tournament exists, the frontend fetches `/api/tournament/{uuid}` which returns full state including `currentMatch` — no second round-trip needed. If no active tournament exists, `POST /api/tournament` creates one and returns full state inline, also skipping the second round-trip. The first images appear with just 1 HTTP request.
+
 ### Double-Click Protection
 
 **Frontend:** Both image buttons disabled immediately on first click. Re-enabled on response or timeout (5s).
@@ -227,12 +212,12 @@ if match.winner is not None:
 
 1. Fetch `last_match_id` from tournament row
 2. Clear that match's `winner` and `completed_at`
-3. Decrement each image's `round_reached` by 1
+3. Decrement winner's `round_reached` by 1
 4. Decrement winner's `wins` by 1
-5. Set tournament `current_round` and `current_match` back to point at that match
-6. Return the undone match as the current match
+5. Set tournament `last_match_id` to the previous completed match (or NULL)
+6. Return the updated tournament state with new `matches[]` array
 
-Constraint: Only the immediately previous match can be undone. Undo is a single-step operation.
+Constraint: Only the immediately previous match can be undone. Undo is a single-step operation. Because all rounds are pre-generated, undo simply clears the winner on the match row — no round or match regeneration needed.
 
 ## Output Formats
 
