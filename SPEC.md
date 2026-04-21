@@ -237,7 +237,8 @@ Full tournament state as shown above.
 Environment variables:
 - `IMAGE_FOLDERS` — colon-separated list of image directory paths (default: `/images`)
 - `DATA_DIR` — where to store tournament DBs (default: `/data`)
-- `EXPORT_FOLDER` — if set, tournament completion triggers copy of all scored images to this folder with `{score}_{filename}` prefix, overwriting existing files (default: none — feature disabled)
+- `EXPORT_FOLDER` — if set, tournament completion triggers copy of all scored images to this folder flat (no subdirectories), with `{score}_{stem}_{hash}{ext}` filename format. Hash (8-char hex, from path hash) prevents collisions when different source dirs have same filename. Example: `1.000_photo_a3f2b1c1.jpg`. Overwrites existing files. (default: none — feature disabled)
+- `SAMPLE_SIZE` — if set to a positive integer, randomly sample exactly that many images from `IMAGE_FOLDERS` before tournament creation. All images used if the setting is 0 or greater than the total found. Sampling is random (not seeded) using `random.shuffle()` on the full list then slice. (default: 0 — no sampling)
 - `RESET` — if set to `1` or `true`, wipes all existing tournament databases in DATA_DIR on startup before resuming or creating a tournament (default: none — feature disabled)
 
 No config file. All runtime config via env vars.

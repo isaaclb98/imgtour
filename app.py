@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import hashlib
 import io
 import logging
 import math
@@ -43,6 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 EXPORT_FOLDER = os.getenv("EXPORT_FOLDER", "").strip()
 RESET = os.getenv("RESET", "").strip().lower() in ("1", "true")
+SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "0") or "0")  # 0 = no sampling, use all images
 
 # Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
 _UUID4_RE = re.compile(
@@ -104,7 +106,15 @@ async def copy_scored_images(tournament_uuid: str) -> None:
             continue
 
         score_str = f"{row['score']:.3f}"
-        dest_name = f"{score_str}_{src.name}"
+        # Use MD5 hash prefix of the original path to avoid collisions when
+        # different source directories have files with the same name (e.g.
+        # /photos/vacation/img.jpg vs /photos/birthday/img.jpg). MD5 is
+        # deterministic across processes unlike Python's hash(). Store flat
+        # with no directory structure.
+        path_hash = hashlib.md5(row["image_path"].encode()).hexdigest()[:8]
+        stem = src.stem
+        ext = src.suffix
+        dest_name = f"{score_str}_{stem}_{path_hash}{ext}"
         dest = export_path / dest_name
 
         await asyncio.to_thread(shutil.copy2, src, dest)
@@ -470,6 +480,13 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
     if not image_paths:
         LOGGER.warning("No valid images found in IMAGE_FOLDERS")
         return None
+
+    # Randomly sample if SAMPLE_SIZE is set and greater than 0
+    if SAMPLE_SIZE > 0 and SAMPLE_SIZE < len(image_paths):
+        import random as random_module
+        random_module.shuffle(image_paths)
+        image_paths = image_paths[:SAMPLE_SIZE]
+        LOGGER.info("Sampled %d images (sample_size=%d)", len(image_paths), SAMPLE_SIZE)
 
     tournament_uuid = str(uuid.uuid4())
     total_images = len(image_paths)
