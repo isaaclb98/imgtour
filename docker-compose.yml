@@ -1,12 +1,18 @@
 services:
   app:
-    build: .
+    image: isaaclb98/imgtour:latest
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/data
+      - imgtour_data:/data
       - /path/to/images:/images:ro
-      - ./export:/export:rw
+      - imgtour_export:/export:rw
     environment:
       - IMAGE_FOLDERS=/images
       - EXPORT_FOLDER=/export
+      - SAMPLE_SIZE=0
+      - RESET=0
+
+volumes:
+  imgtour_data:
+  imgtour_export:
