@@ -11,6 +11,8 @@ services:
     environment:
       - IMAGE_FOLDERS=/images
       - EXPORT_FOLDER=/export
+      - SAMPLE_SIZE=0
+      - RESET=
 
 volumes:
   imgtour_data:
