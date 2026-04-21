@@ -51,6 +51,11 @@ _UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I
 )
 
+THUMB_DIR = DATA_DIR / "thumbnails"
+THUMB_MAX_DIM = 1000
+THUMB_QUALITY = 85
+THUMB_WORKERS = 50
+
 
 def is_valid_uuid(value: str) -> bool:
     return bool(_UUID4_RE.match(value))
@@ -119,6 +124,62 @@ async def copy_scored_images(tournament_uuid: str) -> None:
 
         await asyncio.to_thread(shutil.copy2, src, dest)
         LOGGER.info("Exported: %s -> %s", src.name, dest_name)
+
+
+async def generate_thumbnails(tournament_uuid: str, image_paths: list[str]) -> None:
+    """
+    Background task: generate thumbnails for all tournament images using a bounded
+    sliding window of workers. Queue size caps memory usage regardless of image count.
+    """
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    tournament_thumb_dir = THUMB_DIR / f"tournament_{tournament_uuid}"
+    tournament_thumb_dir.mkdir(parents=True, exist_ok=True)
+
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=THUMB_WORKERS)
+    shutdown_event = asyncio.Event()
+
+    async def worker():
+        while not shutdown_event.is_set():
+            try:
+                image_path = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            try:
+                await asyncio.to_thread(_write_thumbnail, Path(image_path), tournament_thumb_dir, tournament_uuid)
+            except Exception as exc:
+                LOGGER.warning("Thumbnail generation failed for %s: %s", image_path, exc)
+            finally:
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(THUMB_WORKERS)]
+
+    try:
+        for path in image_paths:
+            if shutdown_event.is_set():
+                break
+            await queue.put(path)
+        await queue.join()
+    finally:
+        shutdown_event.set()
+        await asyncio.gather(*workers, return_exceptions=True)
+        LOGGER.info("Thumbnail generation complete for tournament %s", tournament_uuid)
+
+
+def _write_thumbnail(source: Path, thumb_dir: Path, tournament_uuid: str) -> None:
+    """Generate a thumbnail for a single image. Thread-safe, writes directly to disk."""
+    try:
+        img = Image.open(source)
+        img.verify()
+        img = Image.open(source)
+    except Exception:
+        return
+
+    img.thumbnail((THUMB_MAX_DIM, THUMB_MAX_DIM), Image.LANCZOS)
+    thumb_name = hashlib.md5((str(source) + tournament_uuid).encode()).hexdigest()[:16] + ".jpg"
+    thumb_path = thumb_dir / thumb_name
+
+    img.convert("RGB").save(thumb_path, "JPEG", quality=THUMB_QUALITY, optimize=True)
 
 
 def parse_image_folders() -> list[Path]:
@@ -580,6 +641,8 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
 
         await db.commit()
         LOGGER.info("Created tournament %s with %s images", tournament_uuid, total_images)
+        # Fire off thumbnail generation in the background — doesn't block the response
+        asyncio.create_task(generate_thumbnails(tournament_uuid, image_paths))
         return tournament_uuid
     except Exception:
         LOGGER.exception("Failed to create tournament %s", tournament_uuid)
@@ -673,7 +736,21 @@ async def lifespan(app):
         before = len(list(DATA_DIR.glob("tournament_*.db")))
         for db_path in DATA_DIR.glob("tournament_*.db"):
             db_path.unlink(missing_ok=True)
-        LOGGER.info("RESET enabled — cleared %s tournament DBs", before)
+        if THUMB_DIR.exists():
+            shutil.rmtree(THUMB_DIR)
+            THUMB_DIR.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("RESET enabled — cleared %s tournament DBs and thumbnails", before)
+
+    # Clean up orphaned thumbnail directories (tournaments that no longer exist)
+    if THUMB_DIR.exists():
+        active_uuids = {extract_uuid_from_db_path(p) for p in DATA_DIR.glob("tournament_*.db")}
+        for thumb_subdir in THUMB_DIR.iterdir():
+            if thumb_subdir.is_dir() and thumb_subdir.name.startswith("tournament_"):
+                thumb_uuid = thumb_subdir.name[len("tournament_"):]
+                if thumb_uuid not in active_uuids:
+                    shutil.rmtree(thumb_subdir)
+                    LOGGER.info("Removed orphaned thumbnail dir: %s", thumb_subdir.name)
+
     active_uuid = await find_active_tournament_uuid()
     if active_uuid:
         app.state.active_uuid = active_uuid
@@ -1306,6 +1383,15 @@ async def serve_image(request: Request) -> Response:
         raise HTTPException(status_code=404, detail="Image not found")
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
+
+    # Serve thumbnail if it exists (generated in background during tournament creation)
+    active_uuid = getattr(app.state, "active_uuid", None)
+    if active_uuid:
+        thumb_name = hashlib.md5((str(resolved) + active_uuid).encode()).hexdigest()[:16] + ".jpg"
+        thumb_path = THUMB_DIR / f"tournament_{active_uuid}" / thumb_name
+        if thumb_path.exists():
+            return FileResponse(thumb_path)
+
     return FileResponse(resolved)
 
 
