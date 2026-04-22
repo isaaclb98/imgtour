@@ -423,7 +423,7 @@ async def create_round_matches(
         )
         if image_row is None:
             raise HTTPException(status_code=500, detail="Image record missing for bye")
-        await update_image_score(db, tournament_uuid, bye_image, int(image_row["round_reached"]) + 1, total_rounds)
+        await update_image_score(db, tournament_uuid, bye_image, round_number, total_rounds)
 
     for index in range(0, len(shuffled), 2):
         await db.execute(
