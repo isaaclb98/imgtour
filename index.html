@@ -253,6 +253,8 @@
               state.matches.push(m);
             }
           }
+          // Re-evaluate current match index now that new round matches may exist
+          state.currentMatchIndex = findCurrentMatchIndex();
         }
         state.pendingVote = false;
         state.disabled = false;
