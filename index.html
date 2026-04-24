@@ -218,26 +218,28 @@
     }
 
     async function vote(winnerPath) {
-      if (state.disabled || state.pendingVote) return;
-      state.disabled = true;
+      if (state.pendingVote) return;
       state.pendingVote = true;
+      state.disabled = true;
       const match = state.matches[state.currentMatchIndex];
+      const matchId = match.id;
       try {
-        await api(`/api/match/${match.id}`, {
+        const data = await api(`/api/match/${matchId}`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({winner: winnerPath}),
         });
-        state.pendingVote = false;
-        if (state.currentMatchIndex < state.matches.length - 1) {
-          state.currentMatchIndex++;
+        if (data.tournament) {
+          state.matches = data.tournament.matches || [];
+          const newIdx = data.tournament.currentMatchIndex;
+          if (typeof newIdx === 'number') state.currentMatchIndex = newIdx;
         }
         updateUI();
       } catch(e) {
         console.error(e);
-        state.disabled = false;
-        state.pendingVote = false;
       }
+      state.pendingVote = false;
+      state.disabled = false;
     }
 
     async function undo() {
