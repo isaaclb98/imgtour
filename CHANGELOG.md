@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to Semantic Versioning.
 
+## [0.2.1.0] - 2026-04-24
+
+### Fixed
+- vote() state management: reset state.disabled after API response completes (not in finally block), fixing stuck UI after voting
+- Match SELECT queries: add missing bracket/losers_round/is_final fields to all queries used with serialize_match
+- Replace em-dash (U+2014) with ASCII hyphen in index.html template literals for JS compatibility
+
+### Added
+- Playwright smoke test (test_voting.js): 20-click voting workflow verification
+
 ## [0.2.0.0] - 2026-04-24
 
 ### Added
