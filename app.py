@@ -723,7 +723,7 @@ async def build_tournament_state(
         next_match_row = await fetchone(
             db,
             """
-            SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+            SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
             FROM matches
             WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
             ORDER BY id
@@ -1093,7 +1093,7 @@ async def get_match(request: Request) -> Response:
                     row = await fetchone(
                         db,
                         """
-                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                         FROM matches
                         WHERE id = ?
                         """,
@@ -1111,7 +1111,7 @@ async def get_match(request: Request) -> Response:
                 row = await fetchone(
                     db,
                     """
-                    SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                    SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                     FROM matches
                     WHERE id = ?
                     """,
@@ -1150,7 +1150,7 @@ async def record_match_result(request: Request) -> Response:
                     row = await fetchone(
                         db,
                         """
-                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                         FROM matches
                         WHERE id = ?
                         """,
@@ -1170,7 +1170,7 @@ async def record_match_result(request: Request) -> Response:
                     row = await fetchone(
                         db,
                         """
-                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                         FROM matches
                         WHERE id = ?
                         """,
@@ -1287,7 +1287,7 @@ async def record_match_result(request: Request) -> Response:
             new_current_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id
@@ -1298,7 +1298,7 @@ async def record_match_result(request: Request) -> Response:
             new_next_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id
@@ -1600,7 +1600,7 @@ async def vote_match(request: Request) -> Response:
             new_current_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id
@@ -1611,7 +1611,7 @@ async def vote_match(request: Request) -> Response:
             new_next_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id
