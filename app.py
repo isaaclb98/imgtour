@@ -485,16 +485,20 @@ async def collect_round_survivors(
     db: aiosqlite.Connection,
     tournament_uuid: str,
     round_number: int,
+    bracket: str = "winners",
 ) -> list[str]:
     rows = await fetchall(
         db,
         """
-        SELECT image_path
-        FROM images
-        WHERE tournament_id = ? AND round_reached = ?
-        ORDER BY image_path
+        SELECT i.image_path
+        FROM images i
+        JOIN matches m ON m.winner_path = i.image_path
+            AND m.tournament_id = i.tournament_id
+            AND m.bracket = ?
+        WHERE i.tournament_id = ? AND i.round_reached = ?
+        ORDER BY i.image_path
         """,
-        (tournament_uuid, round_number),
+        (bracket, tournament_uuid, round_number),
     )
     return [str(row["image_path"]) for row in rows]
 
@@ -1058,7 +1062,7 @@ async def record_match_result(request: Request) -> Response:
             pending_count = int(pending_row["count"]) if pending_row else 0
 
             if pending_count == 0:
-                survivors = await collect_round_survivors(db, tournament_uuid, round_number)
+                survivors = await collect_round_survivors(db, tournament_uuid, round_number, "winners")
                 if len(survivors) <= 1:
                     await db.execute(
                         """
@@ -1251,9 +1255,10 @@ async def vote_match(request: Request) -> Response:
                         round_number = int(match_row["round"])
                         if not hasattr(app.state, "losers_queues"):
                             app.state.losers_queues = {}
-                        if round_number not in app.state.losers_queues:
-                            app.state.losers_queues[round_number] = []
-                        app.state.losers_queues[round_number].append(loser)
+                        key = (tournament_uuid, round_number)
+                        if key not in app.state.losers_queues:
+                            app.state.losers_queues[key] = []
+                        app.state.losers_queues[key].append(loser)
                     elif loser_row:
                         # lives == 1, second loss — eliminate
                         await db.execute(
@@ -1288,7 +1293,7 @@ async def vote_match(request: Request) -> Response:
                 if is_slow:
                     if bracket == "winners":
                         # Winners round complete — advance winners, create losers bracket round
-                        survivors = await collect_round_survivors(db, tournament_uuid, round_number)
+                        survivors = await collect_round_survivors(db, tournament_uuid, round_number, "winners")
                         if len(survivors) <= 1:
                             # Winners bracket complete — insert final match
                             await db.execute(
@@ -1339,30 +1344,34 @@ async def vote_match(request: Request) -> Response:
                             )
                             await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
                             # Create losers bracket matches from accumulated losers for this round
-                            if hasattr(app.state, "losers_queues") and round_number in app.state.losers_queues:
-                                queue = app.state.losers_queues.pop(round_number, [])
+                            key = (tournament_uuid, round_number)
+                            if hasattr(app.state, "losers_queues") and key in app.state.losers_queues:
+                                queue = app.state.losers_queues.pop(key, [])
                                 if queue:
                                     await create_losers_matches(db, tournament_uuid, round_number, queue)
                     else:
                         # Losers bracket round complete — create next losers round
                         losers_queue = getattr(app.state, "losers_queues", {})
                         # Get losers that just entered (from previous winners round)
-                        new_losers = losers_queue.get(round_number, [])
+                        key = (tournament_uuid, round_number)
+                        new_losers = losers_queue.get(key, [])
                         next_losers_round = round_number + 1
                         # Check if there are winners bracket survivors entering losers this round
-                        if hasattr(app.state, "losers_queues") and (round_number + 1) in app.state.losers_queues:
-                            new_losers = new_losers + app.state.losers_queues.get(round_number + 1, [])
+                        next_key = (tournament_uuid, round_number + 1)
+                        if next_key in losers_queue:
+                            new_losers = new_losers + losers_queue.get(next_key, [])
                         if new_losers or len(new_losers) % 2 == 1:
                             waiting = await create_losers_matches(db, tournament_uuid, next_losers_round, new_losers)
                             if waiting:
                                 if not hasattr(app.state, "losers_queues"):
                                     app.state.losers_queues = {}
-                                if next_losers_round not in app.state.losers_queues:
-                                    app.state.losers_queues[next_losers_round] = []
-                                app.state.losers_queues[next_losers_round].extend(waiting)
+                                wait_key = (tournament_uuid, next_losers_round)
+                                if wait_key not in app.state.losers_queues:
+                                    app.state.losers_queues[wait_key] = []
+                                app.state.losers_queues[wait_key].extend(waiting)
                 else:
                     # Fast mode — standard single elimination
-                    survivors = await collect_round_survivors(db, tournament_uuid, round_number)
+                    survivors = await collect_round_survivors(db, tournament_uuid, round_number, "winners")
                     if len(survivors) <= 1:
                         await db.execute(
                             """
