@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 EXPORT_FOLDER = os.getenv("EXPORT_FOLDER", "").strip()
 RESET = os.getenv("RESET", "").strip().lower() in ("1", "true")
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "0") or "0")  # 0 = no sampling, use all images
-TOURNAMENT_MODE = os.getenv("TOURNAMENT_MODE", "fast").strip().lower()  # fast or slow
+TOURNAMENT_MODE = os.getenv("TOURNAMENT_MODE", "slow").strip().lower()  # normal or slow
 
 # Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
 _UUID4_RE = re.compile(
@@ -317,7 +317,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
             last_match_id INTEGER,
             created_at TEXT NOT NULL,
             completed_at TEXT,
-            mode TEXT NOT NULL DEFAULT 'fast',
+            mode TEXT NOT NULL DEFAULT 'normal',
             winners_bracket_complete INTEGER NOT NULL DEFAULT 0
         );
 
@@ -614,12 +614,20 @@ async def collect_round_survivors(
               AND i.losers_entrance_round IS NULL
               AND i.round_reached >= ?
               AND (
+                  (
                   SELECT MAX(m.round)
                   FROM matches m
                   WHERE m.winner_path = i.image_path
                     AND m.tournament_id = i.tournament_id
                     AND m.bracket = 'winners'
               ) <= ?
+              OR NOT EXISTS (
+                  SELECT 1 FROM matches m
+                  WHERE m.winner_path = i.image_path
+                    AND m.tournament_id = i.tournament_id
+                    AND m.bracket = 'winners'
+              )
+              )
             ORDER BY i.image_path
             """,
             (tournament_uuid, round_number, round_number),
@@ -715,7 +723,7 @@ async def build_tournament_state(
         next_match_row = await fetchone(
             db,
             """
-            SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+            SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
             FROM matches
             WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
             ORDER BY id
@@ -752,7 +760,7 @@ async def build_tournament_state_with_matches(
 
     completed_matches = int(row["completed_count"])
     total_images = int(row["total_images"])
-    mode = row["mode"] if "mode" in row else "fast"
+    mode = str(row["mode"]) if row["mode"] is not None else "normal"
     if mode == "slow":
         # Double elimination: winners bracket (N-1) + losers bracket (~N-2) + final (1)
         total_matches = max(2 * total_images - 2, 0)
@@ -778,7 +786,7 @@ async def build_tournament_state_with_matches(
         "currentMatchIndex": current_match_index,
         "currentMatchId": current_match_row["id"] if current_match_row else None,
         "lastMatchId": row["last_match_id"],
-        "winnersBracketComplete": bool(row["winners_bracket_complete"]) if "winners_bracket_complete" in row else False,
+        "winnersBracketComplete": bool(row["winners_bracket_complete"]),
         "currentMatch": serialize_match(current_match_row),
         "nextMatch": serialize_match(next_match_row),
         "matches": [
@@ -1085,7 +1093,7 @@ async def get_match(request: Request) -> Response:
                     row = await fetchone(
                         db,
                         """
-                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                         FROM matches
                         WHERE id = ?
                         """,
@@ -1103,7 +1111,7 @@ async def get_match(request: Request) -> Response:
                 row = await fetchone(
                     db,
                     """
-                    SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                    SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                     FROM matches
                     WHERE id = ?
                     """,
@@ -1142,7 +1150,7 @@ async def record_match_result(request: Request) -> Response:
                     row = await fetchone(
                         db,
                         """
-                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                         FROM matches
                         WHERE id = ?
                         """,
@@ -1162,7 +1170,7 @@ async def record_match_result(request: Request) -> Response:
                     row = await fetchone(
                         db,
                         """
-                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                         FROM matches
                         WHERE id = ?
                         """,
@@ -1279,7 +1287,7 @@ async def record_match_result(request: Request) -> Response:
             new_current_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id
@@ -1290,7 +1298,7 @@ async def record_match_result(request: Request) -> Response:
             new_next_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id
@@ -1313,6 +1321,7 @@ async def vote_match(request: Request) -> Response:
     When a round completes, advances to the next round.
 
     Slow mode (TOURNAMENT_MODE=slow): double elimination with winners and losers brackets.
+    Normal mode (TOURNAMENT_MODE=normal, default): standard single elimination.
     Losers from the winners bracket enter the losers bracket. Match loser loses a life;
     second loss eliminates the image. Final match is between winners bracket champion
     and losers bracket champion.
@@ -1591,7 +1600,7 @@ async def vote_match(request: Request) -> Response:
             new_current_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id
@@ -1602,7 +1611,7 @@ async def vote_match(request: Request) -> Response:
             new_next_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
                 FROM matches
                 WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
                 ORDER BY id

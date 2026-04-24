@@ -12,8 +12,8 @@ services:
       - EXPORT_FOLDER=/export
       - SAMPLE_SIZE=0
       - RESET=0
-      - TOURNAMENT_MODE=fast
-      # - TOURNAMENT_MODE=slow
+      - TOURNAMENT_MODE=slow
+      # - TOURNAMENT_MODE=normal
 
 volumes:
   imgtour_data:

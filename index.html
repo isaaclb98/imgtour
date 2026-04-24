@@ -163,7 +163,7 @@
       disabled: false,
       pendingVote: false,
       totalRounds: 0,
-      mode: 'fast',
+      mode: "normal",
     };
 
     async function api(path, opts) {
@@ -173,29 +173,26 @@
     }
 
     async function init() {
-      document.getElementById('loading').classList.add('active');
-      const list = await api('/api/tournament').catch(() => null);
-      if (list && list.active_uuid) {
-        state.uuid = list.active_uuid;
-        const t = await api(`/api/tournament/${state.uuid}`);
-        state.matches = t.matches || [];
-        state.images = t.images || [];
-        state.totalRounds = t.totalRounds || 1;
-        state.totalMatches = t.totalMatches || state.matches.length;
-        state.mode = t.mode || 'fast';
-        state.currentMatchIndex = findCurrentMatchIndex();
-      } else {
-        const created = await api('/api/tournament', { method: 'POST' });
-        state.uuid = created.uuid;
-        state.matches = created.matches || [];
-        state.images = created.images || [];
-        state.totalRounds = created.totalRounds || 1;
-        state.totalMatches = created.totalMatches || state.matches.length;
-        state.mode = created.mode || 'fast';
-        state.currentMatchIndex = findCurrentMatchIndex();
+      document.getElementById("loading").classList.add("active");
+      const list = await api("/api/tournament").catch(() => null);
+      if (!list || !list.active_uuid) {
+        document.getElementById("loading").textContent = "No active tournament";
+        return;
       }
+      state.uuid = list.active_uuid;
+      const t = await api(`/api/tournament/${state.uuid}`).catch(() => null);
+      if (!t) {
+        document.getElementById("loading").textContent = "Failed to load tournament";
+        return;
+      }
+      state.matches = t.matches || [];
+      state.images = t.images || [];
+      state.totalMatches = t.totalMatches || 0;
+      state.totalRounds = t.totalRounds || 0;
+      state.mode = t.mode || "normal";
+      state.currentMatchIndex = findCurrentMatchIndex();
       updateUI();
-      document.getElementById('loading').classList.remove('active');
+      document.getElementById("loading").classList.remove("active");
     }
 
     function findCurrentMatchIndex() {
@@ -208,136 +205,86 @@
     function updateUI() {
       const match = state.matches[state.currentMatchIndex];
       if (!match) return;
-
       const completedCount = state.matches.filter(m => m.winner).length;
-      const bracketLabel = match.bracket === 'losers' ? `Losers R${match.losersRound} — ` : (match.bracket === 'winners' && match.round > 1) ? `Winners R${match.round} — ` : '');
-      const finalLabel = match.isFinal ? '🏆 Final — ' : '';
-      document.getElementById('progress').textContent =
-        `${finalLabel}${bracketLabel}Match ${completedCount + 1}/${state.totalMatches}`;
-
-      const imgA = document.getElementById('img-a');
-      const imgB = document.getElementById('img-b');
-      imgA.src = '/api/images/' + encodeURIComponent(match.imageA);
-      imgB.src = '/api/images/' + encodeURIComponent(match.imageB);
-
-      // Lives indicator for slow mode
-      const livesA = getLives(match.imageA);
-      const livesB = getLives(match.imageB);
-
-      const canUndo = completedCount > 0 && state.mode !== 'slow';
-      document.getElementById('undo-btn').disabled = !canUndo;
-
-      const complete = !state.pendingVote && state.matches.every(m => m.winner);
-      if (complete) {
-        document.getElementById('match').style.display = 'none';
-        document.getElementById('chrome').style.display = 'none';
-        document.getElementById('results').style.display = 'flex';
-      }
+      const bracketLabel = match.bracket === "losers" ? `Losers R${match.losersRound} - ` : (match.bracket === "winners" && match.round > 1) ? `Winners R${match.round} - ` : "";
+      const finalLabel = match.isFinal ? "[Trophy] Final - " : "";
+      document.getElementById("progress").textContent = `${finalLabel}${bracketLabel}Match ${completedCount + 1}/${state.totalMatches}`;
+      const imgA = document.getElementById("img-a");
+      const imgB = document.getElementById("img-b");
+      imgA.src = "/api/images/" + encodeURIComponent(match.imageA);
+      imgB.src = "/api/images/" + encodeURIComponent(match.imageB);
+      imgA.style.display = "block";
+      imgB.style.display = "block";
     }
 
-    function getLives(imagePath) {
-      const img = state.images.find(i => i.path.endsWith(imagePath) || i.path === imagePath);
-      return img ? img.lives : 2;
-    }
-
-    function vote(winnerPath) {
-      if (state.disabled) return;
+    async function vote(winnerPath) {
+      if (state.disabled || state.pendingVote) return;
       state.disabled = true;
       state.pendingVote = true;
-
-      // Optimistic local update — instant, no waiting
-      state.matches[state.currentMatchIndex].winner = winnerPath;
-      const prevIndex = state.currentMatchIndex;
-      state.currentMatchIndex = findCurrentMatchIndex();
-      updateUI();
-      prefetchNextMatch();
-
-      // Fire-and-forget persistence — merge returned matches to stay in sync
-      const matchId = state.matches[prevIndex].id;
-      fetch('/api/match/' + matchId + '/vote', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ winner: winnerPath }),
-      }).then(res => res.json()).then(data => {
-        if (data.tournament && data.tournament.matches) {
-          // Merge new matches from server (round N+1 created when round N completed)
-          const existingIds = new Set(state.matches.map(m => m.id));
-          for (const m of data.tournament.matches) {
-            if (!existingIds.has(m.id)) {
-              state.matches.push(m);
-            }
-          }
-          // Re-evaluate current match index now that new round matches may exist
-          state.currentMatchIndex = findCurrentMatchIndex();
+      const match = state.matches[state.currentMatchIndex];
+      try {
+        await api(`/api/match/${match.id}`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({winner: winnerPath}),
+        });
+        state.pendingVote = false;
+        if (state.currentMatchIndex < state.matches.length - 1) {
+          state.currentMatchIndex++;
         }
-        state.pendingVote = false;
-        state.disabled = false;
         updateUI();
-      }).catch(e => {
+      } catch(e) {
         console.error(e);
-        state.pendingVote = false;
         state.disabled = false;
-      });
-    }
-
-    function prefetchNextMatch() {
-      const nextIndex = findCurrentMatchIndex();
-      if (nextIndex < state.matches.length) {
-        const next = state.matches[nextIndex];
-        const preloadA = new Image();
-        const preloadB = new Image();
-        preloadA.src = '/api/images/' + encodeURIComponent(next.imageA);
-        preloadB.src = '/api/images/' + encodeURIComponent(next.imageB);
+        state.pendingVote = false;
       }
     }
 
     async function undo() {
-      if (!state.uuid) return;
-      const lastCompleted = state.matches.filter(m => m.winner).pop();
-      if (!lastCompleted) return;
-
+      if (state.disabled) return;
       state.disabled = true;
       try {
-        const result = await api(`/api/tournament/${state.uuid}/undo`, { method: 'POST' });
-        state.matches = result.matches || [];
+        await api(`/api/tournament/${state.uuid}/undo`, {method: "POST"});
+        const t = await api(`/api/tournament/${state.uuid}`);
+        state.matches = t.matches || [];
+        state.images = t.images || [];
         state.currentMatchIndex = findCurrentMatchIndex();
         updateUI();
-      } catch (e) {
+      } catch(e) {
         console.error(e);
-      } finally {
-        state.disabled = false;
       }
+      state.disabled = false;
     }
 
-    document.getElementById('choice-a').addEventListener('click', () => {
+    document.getElementById("choice-a").addEventListener("click", () => {
       const match = state.matches[state.currentMatchIndex];
       if (!match || state.disabled) return;
       vote(match.imageA);
     });
-    document.getElementById('choice-b').addEventListener('click', () => {
+    document.getElementById("choice-b").addEventListener("click", () => {
       const match = state.matches[state.currentMatchIndex];
       if (!match || state.disabled) return;
       vote(match.imageB);
     });
-    document.getElementById('undo-btn').addEventListener('click', undo);
-    document.getElementById('download-btn').addEventListener('click', () => {
+    document.getElementById("undo-btn").addEventListener("click", undo);
+    document.getElementById("download-btn").addEventListener("click", () => {
       window.location.href = `/api/tournament/${state.uuid}/export`;
     });
 
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowLeft') {
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft") {
         const match = state.matches[state.currentMatchIndex];
         if (match && !state.disabled) vote(match.imageA);
-      } else if (e.key === 'ArrowRight') {
+      } else if (e.key === "ArrowRight") {
         const match = state.matches[state.currentMatchIndex];
         if (match && !state.disabled) vote(match.imageB);
-      } else if (e.key === 'ArrowDown') {
+      } else if (e.key === "ArrowDown") {
         undo();
       }
     });
 
-    document.getElementById('loading').classList.add('active');
+    document.getElementById("loading").classList.add("active");
     init().catch(e => console.error(e));
-  </script>
+</script>
 </body>
 </html>
