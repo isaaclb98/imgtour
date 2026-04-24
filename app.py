@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 EXPORT_FOLDER = os.getenv("EXPORT_FOLDER", "").strip()
 RESET = os.getenv("RESET", "").strip().lower() in ("1", "true")
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "0") or "0")  # 0 = no sampling, use all images
-TOURNAMENT_MODE = os.getenv("TOURNAMENT_MODE", "normal").strip().lower()  # normal or slow
+TOURNAMENT_MODE = os.getenv("TOURNAMENT_MODE", "slow").strip().lower()  # normal or slow
 
 # Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
 _UUID4_RE = re.compile(
