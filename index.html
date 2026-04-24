@@ -163,6 +163,7 @@
       disabled: false,
       pendingVote: false,
       totalRounds: 0,
+      mode: 'fast',
     };
 
     async function api(path, opts) {
@@ -181,6 +182,7 @@
         state.images = t.images || [];
         state.totalRounds = t.totalRounds || 1;
         state.totalMatches = t.totalMatches || state.matches.length;
+        state.mode = t.mode || 'fast';
         state.currentMatchIndex = findCurrentMatchIndex();
       } else {
         const created = await api('/api/tournament', { method: 'POST' });
@@ -189,6 +191,7 @@
         state.images = created.images || [];
         state.totalRounds = created.totalRounds || 1;
         state.totalMatches = created.totalMatches || state.matches.length;
+        state.mode = created.mode || 'fast';
         state.currentMatchIndex = findCurrentMatchIndex();
       }
       updateUI();
@@ -207,15 +210,21 @@
       if (!match) return;
 
       const completedCount = state.matches.filter(m => m.winner).length;
+      const bracketLabel = match.bracket === 'losers' ? `Losers R${match.losersRound} — ` : (match.bracket === 'winners' && match.round > 1) ? `Winners R${match.round} — ` : '');
+      const finalLabel = match.isFinal ? '🏆 Final — ' : '';
       document.getElementById('progress').textContent =
-        `Match ${completedCount + 1}/${state.totalMatches}`;
+        `${finalLabel}${bracketLabel}Match ${completedCount + 1}/${state.totalMatches}`;
 
       const imgA = document.getElementById('img-a');
       const imgB = document.getElementById('img-b');
       imgA.src = '/api/images/' + encodeURIComponent(match.imageA);
       imgB.src = '/api/images/' + encodeURIComponent(match.imageB);
 
-      const canUndo = completedCount > 0;
+      // Lives indicator for slow mode
+      const livesA = getLives(match.imageA);
+      const livesB = getLives(match.imageB);
+
+      const canUndo = completedCount > 0 && state.mode !== 'slow';
       document.getElementById('undo-btn').disabled = !canUndo;
 
       const complete = !state.pendingVote && state.matches.every(m => m.winner);
@@ -224,6 +233,11 @@
         document.getElementById('chrome').style.display = 'none';
         document.getElementById('results').style.display = 'flex';
       }
+    }
+
+    function getLives(imagePath) {
+      const img = state.images.find(i => i.path.endsWith(imagePath) || i.path === imagePath);
+      return img ? img.lives : 2;
     }
 
     function vote(winnerPath) {
