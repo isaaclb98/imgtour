@@ -45,6 +45,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 EXPORT_FOLDER = os.getenv("EXPORT_FOLDER", "").strip()
 RESET = os.getenv("RESET", "").strip().lower() in ("1", "true")
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "0") or "0")  # 0 = no sampling, use all images
+TOURNAMENT_MODE = os.getenv("TOURNAMENT_MODE", "fast").strip().lower()  # fast or slow
 
 # Strict UUID4 pattern — prevents path traversal via ../ in tournament UUID
 _UUID4_RE = re.compile(
@@ -77,6 +78,97 @@ def compute_score(round_reached: int, total_rounds: int) -> float:
     if total_rounds <= 0:
         return 0.0
     return round(round_reached / total_rounds, 3)
+
+
+def compute_placement_score(placement: int, total_images: int) -> float:
+    """Placement-based score for slow mode double elimination."""
+    if total_images <= 1:
+        return 1.0
+    return round((total_images - placement) / (total_images - 1), 3)
+
+
+async def finalize_slow_mode_tournament(db: aiosqlite.Connection, tournament_uuid: str) -> None:
+    """
+    Compute and persist placement scores for all images after a slow mode tournament completes.
+    Placement is derived from the bracket structure:
+    - Winner (winners bracket champion): placement 1
+    - Runner-up (final match loser): placement 2
+    - Remaining placements derived from winners bracket round reached + losers bracket performance
+
+    Uses round_reached, losers_entrance_round, and lives to rank images.
+    """
+    tournament = await fetchone(
+        db,
+        "SELECT total_images FROM tournaments WHERE id = ?",
+        (tournament_uuid,),
+    )
+    if not tournament:
+        return
+    total_images = int(tournament["total_images"])
+
+    # Build placement ranking from bracket structure
+    # 1. Winners bracket champion: best placement (1)
+    # 2. Winners bracket runner-up (lost in last winners round): placement tied for 2 or 3
+    # 3. Losers bracket participants: ordered by how far they got in losers bracket
+    # Lower round_reached with same value = better (lost earlier in winners but survived longer in losers)
+    # Lives=0 = eliminated (placed lower than active)
+
+    images = await fetchall(
+        db,
+        """
+        SELECT image_path, round_reached, wins, lives, losers_entrance_round
+        FROM images WHERE tournament_id = ?
+        ORDER BY
+            lives DESC,
+            round_reached DESC,
+            losers_entrance_round ASC,
+            wins DESC
+        """,
+        (tournament_uuid,),
+    )
+
+    placement = 1
+    prev_round_reached = None
+    prev_lives = None
+    tied_placements: list[str] = []
+
+    for i, img in enumerate(images):
+        lives = int(img["lives"])
+        rr = int(img["round_reached"])
+
+        # Tie detection: same lives and round_reached → same placement
+        if prev_lives == lives and prev_round_reached == rr:
+            tied_placements.append(img["image_path"])
+        else:
+            # Resolve previous tie group
+            if tied_placements:
+                score = compute_placement_score(placement, total_images)
+                for path in tied_placements:
+                    await db.execute(
+                        "UPDATE images SET score = ? WHERE tournament_id = ? AND image_path = ?",
+                        (score, tournament_uuid, path),
+                    )
+                placement += len(tied_placements)
+                tied_placements = []
+            prev_lives = lives
+            prev_round_reached = rr
+
+        # Don't write yet — wait for tie resolution
+        if i == len(images) - 1 and tied_placements:
+            score = compute_placement_score(placement, total_images)
+            for path in tied_placements:
+                await db.execute(
+                    "UPDATE images SET score = ? WHERE tournament_id = ? AND image_path = ?",
+                    (score, tournament_uuid, path),
+                )
+        elif not tied_placements:
+            # No tie — write directly
+            score = compute_placement_score(placement, total_images)
+            await db.execute(
+                "UPDATE images SET score = ? WHERE tournament_id = ? AND image_path = ?",
+                (score, tournament_uuid, img["image_path"]),
+            )
+            placement += 1
 
 
 async def copy_scored_images(tournament_uuid: str) -> None:
@@ -224,7 +316,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
             current_round INTEGER NOT NULL DEFAULT 1,
             last_match_id INTEGER,
             created_at TEXT NOT NULL,
-            completed_at TEXT
+            completed_at TEXT,
+            mode TEXT NOT NULL DEFAULT 'fast',
+            winners_bracket_complete INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS matches (
@@ -234,7 +328,10 @@ async def init_db(db: aiosqlite.Connection) -> None:
             image_a_path TEXT NOT NULL,
             image_b_path TEXT NOT NULL,
             winner_path TEXT,
-            completed_at TEXT
+            completed_at TEXT,
+            bracket TEXT NOT NULL DEFAULT 'winners',
+            losers_round INTEGER,
+            is_final INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS images (
@@ -243,13 +340,18 @@ async def init_db(db: aiosqlite.Connection) -> None:
             image_path TEXT NOT NULL UNIQUE,
             round_reached INTEGER NOT NULL DEFAULT 0,
             wins INTEGER NOT NULL DEFAULT 0,
-            score REAL NOT NULL DEFAULT 0.0
+            score REAL NOT NULL DEFAULT 0.0,
+            lives INTEGER NOT NULL DEFAULT 1,
+            losers_entrance_round INTEGER,
+            losers_match_id INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_matches_tournament ON matches(tournament_id);
         CREATE INDEX IF NOT EXISTS idx_matches_trw ON matches(tournament_id, round, winner_path);
         CREATE INDEX IF NOT EXISTS idx_images_tournament ON images(tournament_id);
         CREATE INDEX IF NOT EXISTS idx_images_tournament_round ON images(tournament_id, round_reached);
+        CREATE INDEX IF NOT EXISTS idx_matches_losers_round ON matches(tournament_id, losers_round);
+        CREATE INDEX IF NOT EXISTS idx_images_losers_match ON images(tournament_id, losers_match_id);
         """
     )
     await db.commit()
@@ -435,29 +537,134 @@ async def create_round_matches(
         )
 
 
+async def create_losers_matches(
+    db: aiosqlite.Connection,
+    tournament_uuid: str,
+    losers_round: int,
+    losers_queue: list[str],
+) -> list[str]:
+    """
+    Create losers bracket matches for a given round.
+
+    Pair images from losers_queue randomly. If odd count, one image waits
+    and is returned as 'remaining' to be paired next round. Returns list
+    of still-waiting image paths (length 0 or 1).
+    """
+    waiting: list[str] = []
+    to_pair = list(losers_queue)
+
+    if len(to_pair) == 1:
+        waiting = to_pair
+        to_pair = []
+    elif len(to_pair) % 2 == 1:
+        waiting = [to_pair.pop()]
+
+    # Shuffle paired images
+    random.SystemRandom().shuffle(to_pair)
+
+    # DB-backed queue: capture inserted match ids for waiting images
+    # An image has losers_match_id set if it is waiting for a partner (odd-count queue)
+    cursor = db.execute("SELECT MAX(id) FROM matches WHERE tournament_id = ?", (tournament_uuid,))
+    base_id = (await cursor.fetchone())[0] or 0
+
+    for index in range(0, len(to_pair), 2):
+        cursor = await db.execute(
+            """
+            INSERT INTO matches (tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final)
+            VALUES (?, ?, ?, ?, NULL, NULL, 'losers', ?, 0)
+            """,
+            (tournament_uuid, losers_round, to_pair[index], to_pair[index + 1]),
+        )
+        inserted_id = cursor.lastrowid
+        # Neither image is waiting — clear any stale losers_match_id
+        await db.execute(
+            "UPDATE images SET losers_match_id = NULL WHERE tournament_id = ? AND image_path IN (?, ?)",
+            (tournament_uuid, to_pair[index], to_pair[index + 1]),
+        )
+
+    # Mark the waiting image (if any) so server restart can reconstruct queue
+    if waiting:
+        inserted_id = base_id + len(to_pair) // 2 + 1
+        await db.execute(
+            "UPDATE images SET losers_match_id = ? WHERE tournament_id = ? AND image_path = ?",
+            (inserted_id, tournament_uuid, waiting[0]),
+        )
+
+    return waiting
+
+
 async def collect_round_survivors(
     db: aiosqlite.Connection,
     tournament_uuid: str,
     round_number: int,
+    bracket: str = "winners",
 ) -> list[str]:
-    rows = await fetchall(
-        db,
-        """
-        SELECT image_path
-        FROM images
-        WHERE tournament_id = ? AND round_reached = ?
-        ORDER BY image_path
-        """,
-        (tournament_uuid, round_number),
-    )
+    if bracket == "winners":
+        # Winners bracket: an image is a survivor at round N if:
+        # 1. round_reached >= N (reached at least round N, via win or bye)
+        # 2. losers_entrance_round IS NULL (not yet eliminated to losers)
+        # 3. has a winning match at or before round N (won a match, or got a bye from
+        #    round N-1 which means round_reached >= N but we need to verify via match records)
+        rows = await fetchall(
+            db,
+            """
+            SELECT i.image_path
+            FROM images i
+            WHERE i.tournament_id = ?
+              AND i.losers_entrance_round IS NULL
+              AND i.round_reached >= ?
+              AND (
+                  SELECT MAX(m.round)
+                  FROM matches m
+                  WHERE m.winner_path = i.image_path
+                    AND m.tournament_id = i.tournament_id
+                    AND m.bracket = 'winners'
+              ) <= ?
+            ORDER BY i.image_path
+            """,
+            (tournament_uuid, round_number, round_number),
+        )
+    else:
+        # Losers bracket: standard matching
+        rows = await fetchall(
+            db,
+            """
+            SELECT i.image_path
+            FROM images i
+            JOIN matches m ON m.winner_path = i.image_path
+                AND m.tournament_id = i.tournament_id
+                AND m.bracket = ?
+            WHERE i.tournament_id = ? AND i.round_reached = ?
+            ORDER BY i.image_path
+            """,
+            (bracket, tournament_uuid, round_number),
+        )
     return [str(row["image_path"]) for row in rows]
 
 
-async def get_current_match_row(db: aiosqlite.Connection, tournament_uuid: str, current_round: int) -> aiosqlite.Row | None:
+async def get_current_match_row(db: aiosqlite.Connection, tournament_uuid: str, current_round: int | None) -> aiosqlite.Row | None:
+    # In slow mode, show first incomplete match regardless of round (both brackets active)
+    if current_round is None:
+        return None
+    tournament_row = await fetchone(db, "SELECT mode FROM tournaments WHERE id = ?", (tournament_uuid,))
+    if tournament_row and tournament_row["mode"] == "slow":
+        # Slow mode: find first incomplete match across all brackets
+        return await fetchone(
+            db,
+            """
+            SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
+            FROM matches
+            WHERE tournament_id = ? AND winner_path IS NULL
+            ORDER BY id
+            LIMIT 1
+            """,
+            (tournament_uuid,),
+        )
+    # Fast mode: filter by current round
     return await fetchone(
         db,
         """
-        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+        SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final
         FROM matches
         WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
         ORDER BY id
@@ -483,6 +690,9 @@ def serialize_match(row: aiosqlite.Row | None) -> dict[str, Any] | None:
         "imageB": rel(row["image_b_path"]),
         "winner": row["winner_path"],
         "completedAt": row["completed_at"],
+        "bracket": row["bracket"],
+        "losersRound": row["losers_round"],
+        "isFinal": bool(row["is_final"]),
     }
 
 
@@ -529,7 +739,7 @@ async def build_tournament_state_with_matches(
         """
         SELECT
             id, status, total_images, total_rounds,
-            current_round, last_match_id,
+            current_round, last_match_id, mode, winners_bracket_complete,
             (SELECT COUNT(*) FROM matches m
              WHERE m.tournament_id = ? AND m.winner_path IS NOT NULL) AS completed_count
         FROM tournaments
@@ -542,8 +752,12 @@ async def build_tournament_state_with_matches(
 
     completed_matches = int(row["completed_count"])
     total_images = int(row["total_images"])
-    # Use total_images - 1 as the tournament total (not DB count, which only has current round)
-    total_matches = max(total_images - 1, 0)
+    mode = row["mode"] if "mode" in row else "fast"
+    if mode == "slow":
+        # Double elimination: winners bracket (N-1) + losers bracket (~N-2) + final (1)
+        total_matches = max(2 * total_images - 2, 0)
+    else:
+        total_matches = max(total_images - 1, 0)
     status = row["status"]
 
     if total_matches == 0:
@@ -556,6 +770,7 @@ async def build_tournament_state_with_matches(
     return {
         "uuid": row["id"],
         "status": status,
+        "mode": mode,
         "totalImages": total_images,
         "totalRounds": int(row["total_rounds"]),
         "totalMatches": total_matches,
@@ -563,6 +778,7 @@ async def build_tournament_state_with_matches(
         "currentMatchIndex": current_match_index,
         "currentMatchId": current_match_row["id"] if current_match_row else None,
         "lastMatchId": row["last_match_id"],
+        "winnersBracketComplete": bool(row["winners_bracket_complete"]) if "winners_bracket_complete" in row else False,
         "currentMatch": serialize_match(current_match_row),
         "nextMatch": serialize_match(next_match_row),
         "matches": [
@@ -573,10 +789,10 @@ async def build_tournament_state_with_matches(
             )
         ],
         "images": [
-            {"path": i["image_path"], "roundReached": i["round_reached"], "wins": i["wins"]}
+            {"path": i["image_path"], "roundReached": i["round_reached"], "wins": i["wins"], "lives": int(i["lives"]), "losersEntranceRound": i["losers_entrance_round"]}
             for i in await fetchall(
                 db,
-                "SELECT image_path, round_reached, wins FROM images WHERE tournament_id = ?",
+                "SELECT image_path, round_reached, wins, lives, losers_entrance_round FROM images WHERE tournament_id = ?",
                 (tournament_uuid,),
             )
         ],
@@ -605,18 +821,20 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
         await db.execute(
             """
             INSERT INTO tournaments (
-                id, status, image_folder, total_images, total_rounds, current_round, last_match_id, created_at, completed_at
+                id, status, image_folder, total_images, total_rounds, current_round, last_match_id, created_at, completed_at, mode, winners_bracket_complete
             )
-            VALUES (?, 'ACTIVE', ?, ?, ?, 1, NULL, ?, NULL)
+            VALUES (?, 'ACTIVE', ?, ?, ?, 1, NULL, ?, NULL, ?, 0)
             """,
-            (tournament_uuid, image_folder_value, total_images, total_rounds, created_at),
+            (tournament_uuid, image_folder_value, total_images, total_rounds, created_at, TOURNAMENT_MODE),
         )
+
+        lives = 2 if TOURNAMENT_MODE == "slow" else 1
         await db.executemany(
             """
-            INSERT INTO images (tournament_id, image_path, round_reached, wins, score)
-            VALUES (?, ?, 0, 0, 0.0)
+            INSERT INTO images (tournament_id, image_path, round_reached, wins, score, lives)
+            VALUES (?, ?, 0, 0, 0.0, ?)
             """,
-            [(tournament_uuid, image_path) for image_path in image_paths],
+            [(tournament_uuid, image_path, lives) for image_path in image_paths],
         )
 
         if total_images == 1:
@@ -648,6 +866,55 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
         if db_path.exists():
             db_path.unlink(missing_ok=True)
         raise
+    finally:
+        await db.close()
+
+
+async def reconstruct_losers_queues(app_state: Any, tournament_uuid: str) -> None:
+    """
+    Reconstruct in-memory losers_queues from DB on server restart.
+
+    An image with losers_match_id set and winner_path IS NULL is waiting
+    for a partner in the losers bracket. The losers_match_id value encodes
+    the round: match_id = (losers_round * 1000) + offset. We derive the
+    losers_round from the associated pending match's losers_round field.
+    """
+    db_path = db_path_for_uuid(tournament_uuid)
+    if not db_path.exists():
+        return
+
+    db = await aiosqlite.connect(db_path)
+    db.row_factory = aiosqlite.Row
+    try:
+        # Find slow mode tournament
+        tournament = await fetchone(db, "SELECT mode FROM tournaments WHERE id = ?", (tournament_uuid,))
+        if not tournament or tournament["mode"] != "slow":
+            return
+
+        # Find images with losers_match_id set and no winner yet
+        waiting_rows = await fetchall(
+            db,
+            """
+            SELECT i.image_path, i.losers_match_id, m.losers_round
+            FROM images i
+            JOIN matches m ON m.id = i.losers_match_id
+                AND m.tournament_id = i.tournament_id
+            WHERE i.tournament_id = ?
+              AND i.losers_match_id IS NOT NULL
+              AND m.winner_path IS NULL
+            ORDER BY m.losers_round, i.image_path
+            """,
+            (tournament_uuid,),
+        )
+
+        app_state.losers_queues = {}
+        for row in waiting_rows:
+            key = (tournament_uuid, int(row["losers_round"]))
+            if key not in app_state.losers_queues:
+                app_state.losers_queues[key] = []
+            app_state.losers_queues[key].append(str(row["image_path"]))
+
+        LOGGER.info("Reconstructed losers_queues: %d waiting images", len(waiting_rows))
     finally:
         await db.close()
 
@@ -754,6 +1021,8 @@ async def lifespan(app):
     if active_uuid:
         app.state.active_uuid = active_uuid
         LOGGER.info("Resuming active tournament %s", active_uuid)
+        # Reconstruct losers_queues from DB for slow mode persistence
+        await reconstruct_losers_queues(app.state, active_uuid)
     else:
         created_uuid = await create_tournament_from_folders(app.state.image_roots)
         app.state.active_uuid = created_uuid
@@ -983,7 +1252,7 @@ async def record_match_result(request: Request) -> Response:
             pending_count = int(pending_row["count"]) if pending_row else 0
 
             if pending_count == 0:
-                survivors = await collect_round_survivors(db, tournament_uuid, round_number)
+                survivors = await collect_round_survivors(db, tournament_uuid, round_number, "winners")
                 if len(survivors) <= 1:
                     await db.execute(
                         """
@@ -1042,6 +1311,11 @@ async def vote_match(request: Request) -> Response:
     """
     Fire-and-forget vote endpoint. Records winner, updates scores, returns immediately.
     When a round completes, advances to the next round.
+
+    Slow mode (TOURNAMENT_MODE=slow): double elimination with winners and losers brackets.
+    Losers from the winners bracket enter the losers bracket. Match loser loses a life;
+    second loss eliminates the image. Final match is between winners bracket champion
+    and losers bracket champion.
     """
     match_id = int(request.path_params["match_id"])
     payload = await request.json()
@@ -1061,7 +1335,7 @@ async def vote_match(request: Request) -> Response:
                 try:
                     row = await fetchone(
                         db,
-                        "SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path FROM matches WHERE id = ?",
+                        "SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, bracket, losers_round, is_final FROM matches WHERE id = ?",
                         (match_id,),
                     )
                     if row:
@@ -1076,7 +1350,7 @@ async def vote_match(request: Request) -> Response:
                 try:
                     row = await fetchone(
                         db,
-                        "SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path FROM matches WHERE id = ?",
+                        "SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, bracket, losers_round, is_final FROM matches WHERE id = ?",
                         (match_id,),
                     )
                     if row:
@@ -1095,11 +1369,13 @@ async def vote_match(request: Request) -> Response:
             tournament_uuid = str(match_row["tournament_id"])
             tournament = await fetchone(
                 db,
-                "SELECT id, status, total_rounds FROM tournaments WHERE id = ?",
+                "SELECT id, status, total_rounds, mode, winners_bracket_complete FROM tournaments WHERE id = ?",
                 (tournament_uuid,),
             )
             if tournament is None or tournament["status"] != "ACTIVE":
                 raise HTTPException(status_code=409, detail="Tournament is not active")
+
+            is_slow = tournament["mode"] == "slow"
 
             if not winner.startswith("/"):
                 winner = f"/images/{winner}"
@@ -1114,6 +1390,25 @@ async def vote_match(request: Request) -> Response:
                 "UPDATE matches SET winner_path = ?, completed_at = ? WHERE id = ?",
                 (winner, now, match_id),
             )
+
+            bracket = str(match_row["bracket"]) if match_row["bracket"] else "winners"
+            is_final = bool(match_row["is_final"])
+
+            if is_final:
+                # Championship match complete — tournament done
+                await db.execute(
+                    """
+                    UPDATE tournaments
+                    SET status = 'COMPLETE', current_round = ?, completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (int(match_row["round"]), utc_now(), tournament_uuid),
+                )
+                await finalize_slow_mode_tournament(db, tournament_uuid)
+                await db.commit()
+                asyncio.create_task(copy_scored_images(tournament_uuid))
+                state = await build_tournament_state(db, tournament_uuid)
+                return JSONResponse({"received": True, "tournament": state})
 
             image_row = await fetchone(
                 db,
@@ -1130,6 +1425,35 @@ async def vote_match(request: Request) -> Response:
                     int(image_row["round_reached"]) + 1,
                     int(tournament["total_rounds"]),
                 )
+
+            # Handle loser
+            loser = match_row["image_a_path"] if winner == match_row["image_b_path"] else match_row["image_b_path"]
+            if is_slow:
+                if bracket == "winners":
+                    # Loser loses a life; if lives remain, enter losers bracket
+                    # Atomic: decrement only if lives > 1
+                    result = await db.execute(
+                        "UPDATE images SET lives = lives - 1, losers_entrance_round = ? WHERE lives > 1 AND tournament_id = ? AND image_path = ?",
+                        (int(match_row["round"]), tournament_uuid, loser),
+                    )
+                    if result.rowcount > 0:
+                        # First loss successful — add to losers queue
+                        round_number = int(match_row["round"])
+                        if not hasattr(app.state, "losers_queues"):
+                            app.state.losers_queues = {}
+                        key = (tournament_uuid, round_number)
+                        if key not in app.state.losers_queues:
+                            app.state.losers_queues[key] = []
+                        app.state.losers_queues[key].append(loser)
+                    else:
+                        # lives <= 1, second loss — eliminate (already handled by atomic WHERE failing)
+                        pass
+                else:
+                    # Losers bracket — second loss eliminates (atomic WHERE)
+                    await db.execute(
+                        "UPDATE images SET lives = 0 WHERE lives >= 0 AND tournament_id = ? AND image_path = ?",
+                        (tournament_uuid, loser),
+                    )
 
             await db.execute(
                 "UPDATE tournaments SET last_match_id = ? WHERE id = ?",
@@ -1149,25 +1473,115 @@ async def vote_match(request: Request) -> Response:
             pending_count = int(pending_row["count"]) if pending_row else 0
 
             if pending_count == 0:
-                survivors = await collect_round_survivors(db, tournament_uuid, round_number)
-                if len(survivors) <= 1:
-                    await db.execute(
-                        """
-                        UPDATE tournaments
-                        SET status = 'COMPLETE', current_round = ?, completed_at = ?
-                        WHERE id = ?
-                        """,
-                        (round_number, utc_now(), tournament_uuid),
-                    )
-                    await db.commit()
-                    asyncio.create_task(copy_scored_images(tournament_uuid))
+                if is_slow:
+                    if bracket == "winners":
+                        # Winners round complete — advance winners, create losers bracket round
+                        survivors = await collect_round_survivors(db, tournament_uuid, round_number, "winners")
+                        if len(survivors) <= 1:
+                            # Winners bracket complete — insert final match
+                            await db.execute(
+                                "UPDATE tournaments SET winners_bracket_complete = 1 WHERE id = ?",
+                                (tournament_uuid,),
+                            )
+                            winners_champion = survivors[0] if survivors else None
+                            if winners_champion:
+                                # Get most recent losers bracket winner
+                                losers_champ_row = await fetchone(
+                                    db,
+                                    """
+                                    SELECT winner_path FROM matches
+                                    WHERE tournament_id = ? AND bracket = 'losers' AND is_final = 0 AND winner_path IS NOT NULL
+                                    ORDER BY losers_round DESC, id DESC LIMIT 1
+                                    """,
+                                    (tournament_uuid,),
+                                )
+                                if losers_champ_row:
+                                    next_losers_round = await fetchone(
+                                        db,
+                                        "SELECT COALESCE(MAX(losers_round), 0) + 1 AS next_round FROM matches WHERE tournament_id = ?",
+                                        (tournament_uuid,),
+                                    )
+                                    next_round_num = int(next_losers_round["next_round"]) if next_losers_round else 1
+                                    await db.execute(
+                                        """
+                                        INSERT INTO matches (tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final)
+                                        VALUES (?, ?, ?, ?, NULL, NULL, 'losers', ?, 1)
+                                        """,
+                                        (tournament_uuid, round_number + 1, winners_champion, losers_champ_row["winner_path"]),
+                                    )
+                            await db.execute(
+                                """
+                                UPDATE tournaments
+                                SET status = 'COMPLETE', current_round = ?, completed_at = ?
+                                WHERE id = ?
+                                """,
+                                (round_number, utc_now(), tournament_uuid),
+                            )
+                            await finalize_slow_mode_tournament(db, tournament_uuid)
+                            await db.commit()
+                            asyncio.create_task(copy_scored_images(tournament_uuid))
+                        else:
+                            next_round = round_number + 1
+                            await db.execute(
+                                "UPDATE tournaments SET current_round = ? WHERE id = ?",
+                                (next_round, tournament_uuid),
+                            )
+                            await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
+                            # Create losers bracket matches from accumulated losers for this round
+                            key = (tournament_uuid, round_number)
+                            if hasattr(app.state, "losers_queues") and key in app.state.losers_queues:
+                                queue = app.state.losers_queues.pop(key, [])
+                                if queue:
+                                    waiting = await create_losers_matches(db, tournament_uuid, round_number, queue)
+                                    # Carry waiting image to next losers round
+                                    if waiting:
+                                        next_key = (tournament_uuid, round_number + 1)
+                                        if not hasattr(app.state, "losers_queues"):
+                                            app.state.losers_queues = {}
+                                        if next_key not in app.state.losers_queues:
+                                            app.state.losers_queues[next_key] = []
+                                        app.state.losers_queues[next_key].extend(waiting)
+                    else:
+                        # Losers bracket round complete — create next losers round
+                        losers_queue = getattr(app.state, "losers_queues", {})
+                        # Get losers that just entered (from previous winners round)
+                        key = (tournament_uuid, round_number)
+                        new_losers = losers_queue.get(key, [])
+                        next_losers_round = round_number + 1
+                        # Check if there are winners bracket survivors entering losers this round
+                        next_key = (tournament_uuid, round_number + 1)
+                        if next_key in losers_queue:
+                            new_losers = new_losers + losers_queue.get(next_key, [])
+                        if new_losers:
+                            waiting = await create_losers_matches(db, tournament_uuid, next_losers_round, new_losers)
+                            if waiting:
+                                if not hasattr(app.state, "losers_queues"):
+                                    app.state.losers_queues = {}
+                                wait_key = (tournament_uuid, next_losers_round)
+                                if wait_key not in app.state.losers_queues:
+                                    app.state.losers_queues[wait_key] = []
+                                app.state.losers_queues[wait_key].extend(waiting)
                 else:
-                    next_round = round_number + 1
-                    await db.execute(
-                        "UPDATE tournaments SET current_round = ? WHERE id = ?",
-                        (next_round, tournament_uuid),
-                    )
-                    await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
+                    # Fast mode — standard single elimination
+                    survivors = await collect_round_survivors(db, tournament_uuid, round_number, "winners")
+                    if len(survivors) <= 1:
+                        await db.execute(
+                            """
+                            UPDATE tournaments
+                            SET status = 'COMPLETE', current_round = ?, completed_at = ?
+                            WHERE id = ?
+                            """,
+                            (round_number, utc_now(), tournament_uuid),
+                        )
+                        await db.commit()
+                        asyncio.create_task(copy_scored_images(tournament_uuid))
+                    else:
+                        next_round = round_number + 1
+                        await db.execute(
+                            "UPDATE tournaments SET current_round = ? WHERE id = ?",
+                            (next_round, tournament_uuid),
+                        )
+                        await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
 
             await db.commit()
 
@@ -1271,6 +1685,8 @@ async def undo_last_match(request: Request) -> Response:
                 raise HTTPException(status_code=404, detail="Tournament not found")
             if tournament["last_match_id"] is None:
                 raise HTTPException(status_code=409, detail="No match to undo")
+            if tournament.get("mode") == "slow":
+                raise HTTPException(status_code=403, detail="Undo not supported in slow mode")
 
             last_match = await fetchone(
                 db,
