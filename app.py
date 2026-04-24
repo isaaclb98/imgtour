@@ -579,19 +579,46 @@ async def collect_round_survivors(
     round_number: int,
     bracket: str = "winners",
 ) -> list[str]:
-    rows = await fetchall(
-        db,
-        """
-        SELECT i.image_path
-        FROM images i
-        JOIN matches m ON m.winner_path = i.image_path
-            AND m.tournament_id = i.tournament_id
-            AND m.bracket = ?
-        WHERE i.tournament_id = ? AND i.round_reached = ?
-        ORDER BY i.image_path
-        """,
-        (bracket, tournament_uuid, round_number),
-    )
+    if bracket == "winners":
+        # Winners bracket: an image is a survivor at round N if:
+        # 1. round_reached >= N (reached at least round N, via win or bye)
+        # 2. losers_entrance_round IS NULL (not yet eliminated to losers)
+        # 3. has a winning match at or before round N (won a match, or got a bye from
+        #    round N-1 which means round_reached >= N but we need to verify via match records)
+        rows = await fetchall(
+            db,
+            """
+            SELECT i.image_path
+            FROM images i
+            WHERE i.tournament_id = ?
+              AND i.losers_entrance_round IS NULL
+              AND i.round_reached >= ?
+              AND (
+                  SELECT MAX(m.round)
+                  FROM matches m
+                  WHERE m.winner_path = i.image_path
+                    AND m.tournament_id = i.tournament_id
+                    AND m.bracket = 'winners'
+              ) <= ?
+            ORDER BY i.image_path
+            """,
+            (tournament_uuid, round_number, round_number),
+        )
+    else:
+        # Losers bracket: standard matching
+        rows = await fetchall(
+            db,
+            """
+            SELECT i.image_path
+            FROM images i
+            JOIN matches m ON m.winner_path = i.image_path
+                AND m.tournament_id = i.tournament_id
+                AND m.bracket = ?
+            WHERE i.tournament_id = ? AND i.round_reached = ?
+            ORDER BY i.image_path
+            """,
+            (bracket, tournament_uuid, round_number),
+        )
     return [str(row["image_path"]) for row in rows]
 
 
