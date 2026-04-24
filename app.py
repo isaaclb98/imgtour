@@ -80,6 +80,97 @@ def compute_score(round_reached: int, total_rounds: int) -> float:
     return round(round_reached / total_rounds, 3)
 
 
+def compute_placement_score(placement: int, total_images: int) -> float:
+    """Placement-based score for slow mode double elimination."""
+    if total_images <= 1:
+        return 1.0
+    return round((total_images - placement) / (total_images - 1), 3)
+
+
+async def finalize_slow_mode_tournament(db: aiosqlite.Connection, tournament_uuid: str) -> None:
+    """
+    Compute and persist placement scores for all images after a slow mode tournament completes.
+    Placement is derived from the bracket structure:
+    - Winner (winners bracket champion): placement 1
+    - Runner-up (final match loser): placement 2
+    - Remaining placements derived from winners bracket round reached + losers bracket performance
+
+    Uses round_reached, losers_entrance_round, and lives to rank images.
+    """
+    tournament = await fetchone(
+        db,
+        "SELECT total_images FROM tournaments WHERE id = ?",
+        (tournament_uuid,),
+    )
+    if not tournament:
+        return
+    total_images = int(tournament["total_images"])
+
+    # Build placement ranking from bracket structure
+    # 1. Winners bracket champion: best placement (1)
+    # 2. Winners bracket runner-up (lost in last winners round): placement tied for 2 or 3
+    # 3. Losers bracket participants: ordered by how far they got in losers bracket
+    # Lower round_reached with same value = better (lost earlier in winners but survived longer in losers)
+    # Lives=0 = eliminated (placed lower than active)
+
+    images = await fetchall(
+        db,
+        """
+        SELECT image_path, round_reached, wins, lives, losers_entrance_round
+        FROM images WHERE tournament_id = ?
+        ORDER BY
+            lives DESC,
+            round_reached DESC,
+            losers_entrance_round ASC,
+            wins DESC
+        """,
+        (tournament_uuid,),
+    )
+
+    placement = 1
+    prev_round_reached = None
+    prev_lives = None
+    tied_placements: list[str] = []
+
+    for i, img in enumerate(images):
+        lives = int(img["lives"])
+        rr = int(img["round_reached"])
+
+        # Tie detection: same lives and round_reached → same placement
+        if prev_lives == lives and prev_round_reached == rr:
+            tied_placements.append(img["image_path"])
+        else:
+            # Resolve previous tie group
+            if tied_placements:
+                score = compute_placement_score(placement, total_images)
+                for path in tied_placements:
+                    await db.execute(
+                        "UPDATE images SET score = ? WHERE tournament_id = ? AND image_path = ?",
+                        (score, tournament_uuid, path),
+                    )
+                placement += len(tied_placements)
+                tied_placements = []
+            prev_lives = lives
+            prev_round_reached = rr
+
+        # Don't write yet — wait for tie resolution
+        if i == len(images) - 1 and tied_placements:
+            score = compute_placement_score(placement, total_images)
+            for path in tied_placements:
+                await db.execute(
+                    "UPDATE images SET score = ? WHERE tournament_id = ? AND image_path = ?",
+                    (score, tournament_uuid, path),
+                )
+        elif not tied_placements:
+            # No tie — write directly
+            score = compute_placement_score(placement, total_images)
+            await db.execute(
+                "UPDATE images SET score = ? WHERE tournament_id = ? AND image_path = ?",
+                (score, tournament_uuid, img["image_path"]),
+            )
+            placement += 1
+
+
 async def copy_scored_images(tournament_uuid: str) -> None:
     """
     After tournament completion, copy all scored images to EXPORT_FOLDER
@@ -251,7 +342,8 @@ async def init_db(db: aiosqlite.Connection) -> None:
             wins INTEGER NOT NULL DEFAULT 0,
             score REAL NOT NULL DEFAULT 0.0,
             lives INTEGER NOT NULL DEFAULT 1,
-            losers_entrance_round INTEGER
+            losers_entrance_round INTEGER,
+            losers_match_id INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_matches_tournament ON matches(tournament_id);
@@ -1214,10 +1306,11 @@ async def vote_match(request: Request) -> Response:
                     """,
                     (int(match_row["round"]), utc_now(), tournament_uuid),
                 )
+                await finalize_slow_mode_tournament(db, tournament_uuid)
                 await db.commit()
                 asyncio.create_task(copy_scored_images(tournament_uuid))
                 state = await build_tournament_state(db, tournament_uuid)
-                return JSONResponse({"received": True, "tournament": state}, status_code=202)
+                return JSONResponse({"received": True, "tournament": state})
 
             image_row = await fetchone(
                 db,
@@ -1240,18 +1333,13 @@ async def vote_match(request: Request) -> Response:
             if is_slow:
                 if bracket == "winners":
                     # Loser loses a life; if lives remain, enter losers bracket
-                    loser_row = await fetchone(
-                        db,
-                        "SELECT lives FROM images WHERE tournament_id = ? AND image_path = ?",
-                        (tournament_uuid, loser),
+                    # Atomic: decrement only if lives > 1
+                    result = await db.execute(
+                        "UPDATE images SET lives = lives - 1, losers_entrance_round = ? WHERE lives > 1 AND tournament_id = ? AND image_path = ?",
+                        (int(match_row["round"]), tournament_uuid, loser),
                     )
-                    if loser_row and int(loser_row["lives"]) > 1:
-                        # First loss — decrement lives, set entrance round
-                        await db.execute(
-                            "UPDATE images SET lives = lives - 1, losers_entrance_round = ? WHERE tournament_id = ? AND image_path = ?",
-                            (int(match_row["round"]), tournament_uuid, loser),
-                        )
-                        # Add to losers queue for this round
+                    if result.rowcount > 0:
+                        # First loss successful — add to losers queue
                         round_number = int(match_row["round"])
                         if not hasattr(app.state, "losers_queues"):
                             app.state.losers_queues = {}
@@ -1259,16 +1347,13 @@ async def vote_match(request: Request) -> Response:
                         if key not in app.state.losers_queues:
                             app.state.losers_queues[key] = []
                         app.state.losers_queues[key].append(loser)
-                    elif loser_row:
-                        # lives == 1, second loss — eliminate
-                        await db.execute(
-                            "UPDATE images SET lives = 0 WHERE tournament_id = ? AND image_path = ?",
-                            (tournament_uuid, loser),
-                        )
+                    else:
+                        # lives <= 1, second loss — eliminate (already handled by atomic WHERE failing)
+                        pass
                 else:
-                    # Losers bracket — second loss eliminates
+                    # Losers bracket — second loss eliminates (atomic WHERE)
                     await db.execute(
-                        "UPDATE images SET lives = 0 WHERE tournament_id = ? AND image_path = ?",
+                        "UPDATE images SET lives = 0 WHERE lives >= 0 AND tournament_id = ? AND image_path = ?",
                         (tournament_uuid, loser),
                     )
 
@@ -1334,6 +1419,7 @@ async def vote_match(request: Request) -> Response:
                                 """,
                                 (round_number, utc_now(), tournament_uuid),
                             )
+                            await finalize_slow_mode_tournament(db, tournament_uuid)
                             await db.commit()
                             asyncio.create_task(copy_scored_images(tournament_uuid))
                         else:
