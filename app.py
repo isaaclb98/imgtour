@@ -614,23 +614,25 @@ async def collect_round_survivors(
               AND i.losers_entrance_round IS NULL
               AND i.round_reached >= ?
               AND (
-                  (
-                  SELECT MAX(m.round)
-                  FROM matches m
-                  WHERE m.winner_path = i.image_path
-                    AND m.tournament_id = i.tournament_id
-                    AND m.bracket = 'winners'
-              ) <= ?
-              OR NOT EXISTS (
-                  SELECT 1 FROM matches m
-                  WHERE m.winner_path = i.image_path
-                    AND m.tournament_id = i.tournament_id
-                    AND m.bracket = 'winners'
-              )
+                  CASE
+                  WHEN NOT EXISTS (
+                      SELECT 1 FROM matches m
+                      WHERE m.winner_path = i.image_path
+                        AND m.tournament_id = i.tournament_id
+                        AND m.bracket = 'winners'
+                  ) THEN i.round_reached >= ?
+                  ELSE (
+                      SELECT MAX(m.round)
+                      FROM matches m
+                      WHERE m.winner_path = i.image_path
+                        AND m.tournament_id = i.tournament_id
+                        AND m.bracket = 'winners'
+                  ) <= ?
+                  END
               )
             ORDER BY i.image_path
             """,
-            (tournament_uuid, round_number, round_number),
+            (tournament_uuid, round_number, round_number, round_number),
         )
     else:
         # Losers bracket: standard matching
