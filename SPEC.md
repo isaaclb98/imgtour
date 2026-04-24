@@ -6,17 +6,25 @@ Image tournament scorer for ML training data. Run a binary tournament bracket ov
 
 ## Scoring Formula
 
+**Fast mode (`TOURNAMENT_MODE=normal`):**
 ```
 score = round_reached / total_rounds
 ```
 
+**Slow mode (`TOURNAMENT_MODE=slow`, the default):**
+```
+score = (N - placement) / (N - 1)
+```
+
 `round_reached` = the last round the image participated in (won or lost). Winner participated in all rounds.
 
+`placement` = final position in the bracket (1 = winner, 2 = runner-up, etc.).
+
 Example (8 images, 3 rounds):
-- Winner: 3/3 = 1.000
-- Runner-up: 2/3 = 0.667
-- Semifinal losers: 1/3 = 0.333
-- Quarterfinal losers: 0/3 = 0.000
+- Winner: 3/3 = 1.000 (fast) / (8-1)/(8-1) = 1.000 (slow, placement 1)
+- Runner-up: 2/3 = 0.667 (fast) / (8-2)/(8-1) = 0.857 (slow, placement 2)
+- Semifinal losers: 1/3 = 0.333 (fast) / (8-3)/(8-1) = 0.714 (slow, placement 3)
+- Quarterfinal losers: 0/3 = 0.000 (fast) / (8-5)/(8-1) = 0.429 (slow, placement 5-8)
 
 ## API Endpoints
 
@@ -65,7 +73,7 @@ All rounds are pre-generated at tournament creation. `matches[]` contains every 
 Stored at `/data/tournament_{uuid}.db` in the mounted volume.
 
 ```sql
-CREATE TABLE tournaments (
+CREATE TABLE IF NOT EXISTS tournaments (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'COMPLETE')),
   image_folder TEXT NOT NULL,
@@ -73,31 +81,43 @@ CREATE TABLE tournaments (
   total_rounds INTEGER NOT NULL,
   current_round INTEGER NOT NULL DEFAULT 1,
   last_match_id INTEGER,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  completed_at TEXT
+  created_at TEXT NOT NULL,
+  completed_at TEXT,
+  mode TEXT NOT NULL DEFAULT 'normal',
+  winners_bracket_complete INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE matches (
+CREATE TABLE IF NOT EXISTS matches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tournament_id TEXT NOT NULL REFERENCES tournaments(id),
+  tournament_id TEXT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
   round INTEGER NOT NULL,
   image_a_path TEXT NOT NULL,
   image_b_path TEXT NOT NULL,
   winner_path TEXT,
-  completed_at TEXT
+  completed_at TEXT,
+  bracket TEXT NOT NULL DEFAULT 'winners',
+  losers_round INTEGER,
+  is_final INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE images (
+CREATE TABLE IF NOT EXISTS images (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tournament_id TEXT NOT NULL REFERENCES tournaments(id),
+  tournament_id TEXT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
   image_path TEXT NOT NULL UNIQUE,
   round_reached INTEGER NOT NULL DEFAULT 0,
   wins INTEGER NOT NULL DEFAULT 0,
-  score REAL NOT NULL DEFAULT 0.0
+  score REAL NOT NULL DEFAULT 0.0,
+  lives INTEGER NOT NULL DEFAULT 1,
+  losers_entrance_round INTEGER,
+  losers_match_id INTEGER
 );
 
-CREATE INDEX idx_matches_tournament ON matches(tournament_id);
-CREATE INDEX idx_images_tournament ON images(tournament_id);
+CREATE INDEX IF NOT EXISTS idx_matches_tournament ON matches(tournament_id);
+CREATE INDEX IF NOT EXISTS idx_matches_trw ON matches(tournament_id, round, winner_path);
+CREATE INDEX IF NOT EXISTS idx_images_tournament ON images(tournament_id);
+CREATE INDEX IF NOT EXISTS idx_images_tournament_round ON images(tournament_id, round_reached);
+CREATE INDEX IF NOT EXISTS idx_matches_losers_round ON matches(tournament_id, losers_round);
+CREATE INDEX IF NOT EXISTS idx_images_losers_match ON images(tournament_id, losers_match_id);
 ```
 
 `match_index` removed — matches are generated round-by-round, not pre-paired.
@@ -115,6 +135,8 @@ ACTIVE (client-side tournament engine)
   └─ Client scans matches[] for first winner == null → displays match
   └─ Client vote: optimistic local update, fire-and-forget POST /api/match/{id}/vote
   └─ POST /api/match/{id}/vote: persists winner, updates winner's round_reached/wins/score
+  └─ Slow mode: loser enters losers bracket (lives decremented, second loss eliminates)
+  └─ If winners bracket complete and no lives remain for runner-up → final match
   └─ If all matches complete → status = COMPLETE
 
 TOURNAMENT_COMPLETE
