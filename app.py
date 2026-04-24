@@ -351,6 +351,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_images_tournament ON images(tournament_id);
         CREATE INDEX IF NOT EXISTS idx_images_tournament_round ON images(tournament_id, round_reached);
         CREATE INDEX IF NOT EXISTS idx_matches_losers_round ON matches(tournament_id, losers_round);
+        CREATE INDEX IF NOT EXISTS idx_images_losers_match ON images(tournament_id, losers_match_id);
         """
     )
     await db.commit()
@@ -561,13 +562,32 @@ async def create_losers_matches(
     # Shuffle paired images
     random.SystemRandom().shuffle(to_pair)
 
+    # DB-backed queue: capture inserted match ids for waiting images
+    # An image has losers_match_id set if it is waiting for a partner (odd-count queue)
+    cursor = db.execute("SELECT MAX(id) FROM matches WHERE tournament_id = ?", (tournament_uuid,))
+    base_id = (await cursor.fetchone())[0] or 0
+
     for index in range(0, len(to_pair), 2):
-        await db.execute(
+        cursor = await db.execute(
             """
             INSERT INTO matches (tournament_id, round, image_a_path, image_b_path, winner_path, completed_at, bracket, losers_round, is_final)
             VALUES (?, ?, ?, ?, NULL, NULL, 'losers', ?, 0)
             """,
             (tournament_uuid, losers_round, to_pair[index], to_pair[index + 1]),
+        )
+        inserted_id = cursor.lastrowid
+        # Neither image is waiting — clear any stale losers_match_id
+        await db.execute(
+            "UPDATE images SET losers_match_id = NULL WHERE tournament_id = ? AND image_path IN (?, ?)",
+            (tournament_uuid, to_pair[index], to_pair[index + 1]),
+        )
+
+    # Mark the waiting image (if any) so server restart can reconstruct queue
+    if waiting:
+        inserted_id = base_id + len(to_pair) // 2 + 1
+        await db.execute(
+            "UPDATE images SET losers_match_id = ? WHERE tournament_id = ? AND image_path = ?",
+            (inserted_id, tournament_uuid, waiting[0]),
         )
 
     return waiting
@@ -850,6 +870,55 @@ async def create_tournament_from_folders(image_roots: list[Path]) -> str | None:
         await db.close()
 
 
+async def reconstruct_losers_queues(app_state: Any, tournament_uuid: str) -> None:
+    """
+    Reconstruct in-memory losers_queues from DB on server restart.
+
+    An image with losers_match_id set and winner_path IS NULL is waiting
+    for a partner in the losers bracket. The losers_match_id value encodes
+    the round: match_id = (losers_round * 1000) + offset. We derive the
+    losers_round from the associated pending match's losers_round field.
+    """
+    db_path = db_path_for_uuid(tournament_uuid)
+    if not db_path.exists():
+        return
+
+    db = await aiosqlite.connect(db_path)
+    db.row_factory = aiosqlite.Row
+    try:
+        # Find slow mode tournament
+        tournament = await fetchone(db, "SELECT mode FROM tournaments WHERE id = ?", (tournament_uuid,))
+        if not tournament or tournament["mode"] != "slow":
+            return
+
+        # Find images with losers_match_id set and no winner yet
+        waiting_rows = await fetchall(
+            db,
+            """
+            SELECT i.image_path, i.losers_match_id, m.losers_round
+            FROM images i
+            JOIN matches m ON m.id = i.losers_match_id
+                AND m.tournament_id = i.tournament_id
+            WHERE i.tournament_id = ?
+              AND i.losers_match_id IS NOT NULL
+              AND m.winner_path IS NULL
+            ORDER BY m.losers_round, i.image_path
+            """,
+            (tournament_uuid,),
+        )
+
+        app_state.losers_queues = {}
+        for row in waiting_rows:
+            key = (tournament_uuid, int(row["losers_round"]))
+            if key not in app_state.losers_queues:
+                app_state.losers_queues[key] = []
+            app_state.losers_queues[key].append(str(row["image_path"]))
+
+        LOGGER.info("Reconstructed losers_queues: %d waiting images", len(waiting_rows))
+    finally:
+        await db.close()
+
+
 async def find_active_tournament_uuid() -> str | None:
     if not DATA_DIR.exists():
         return None
@@ -952,6 +1021,8 @@ async def lifespan(app):
     if active_uuid:
         app.state.active_uuid = active_uuid
         LOGGER.info("Resuming active tournament %s", active_uuid)
+        # Reconstruct losers_queues from DB for slow mode persistence
+        await reconstruct_losers_queues(app.state, active_uuid)
     else:
         created_uuid = await create_tournament_from_folders(app.state.image_roots)
         app.state.active_uuid = created_uuid
@@ -1461,7 +1532,15 @@ async def vote_match(request: Request) -> Response:
                             if hasattr(app.state, "losers_queues") and key in app.state.losers_queues:
                                 queue = app.state.losers_queues.pop(key, [])
                                 if queue:
-                                    await create_losers_matches(db, tournament_uuid, round_number, queue)
+                                    waiting = await create_losers_matches(db, tournament_uuid, round_number, queue)
+                                    # Carry waiting image to next losers round
+                                    if waiting:
+                                        next_key = (tournament_uuid, round_number + 1)
+                                        if not hasattr(app.state, "losers_queues"):
+                                            app.state.losers_queues = {}
+                                        if next_key not in app.state.losers_queues:
+                                            app.state.losers_queues[next_key] = []
+                                        app.state.losers_queues[next_key].extend(waiting)
                     else:
                         # Losers bracket round complete — create next losers round
                         losers_queue = getattr(app.state, "losers_queues", {})
@@ -1473,7 +1552,7 @@ async def vote_match(request: Request) -> Response:
                         next_key = (tournament_uuid, round_number + 1)
                         if next_key in losers_queue:
                             new_losers = new_losers + losers_queue.get(next_key, [])
-                        if new_losers or len(new_losers) % 2 == 1:
+                        if new_losers:
                             waiting = await create_losers_matches(db, tournament_uuid, next_losers_round, new_losers)
                             if waiting:
                                 if not hasattr(app.state, "losers_queues"):
