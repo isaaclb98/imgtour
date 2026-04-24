@@ -601,8 +601,8 @@ async def collect_round_survivors(
 ) -> list[str]:
     if bracket == "winners":
         # Winners bracket: an image is a survivor at round N if:
-        # 1. round_reached >= N (reached at least round N, via win or bye)
-        # 2. losers_entrance_round IS NULL (not yet eliminated to losers)
+        # 1. lives > 0 (not eliminated — even if in losers bracket after first loss, still alive)
+        # 2. round_reached >= N (reached at least round N, via win or bye)
         # 3. has a winning match at or before round N (won a match, or got a bye from
         #    round N-1 which means round_reached >= N but we need to verify via match records)
         rows = await fetchall(
@@ -611,7 +611,7 @@ async def collect_round_survivors(
             SELECT i.image_path
             FROM images i
             WHERE i.tournament_id = ?
-              AND i.losers_entrance_round IS NULL
+              AND i.lives > 0
               AND i.round_reached >= ?
               AND (
                   CASE
