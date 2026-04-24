@@ -11,11 +11,17 @@ Image tournament scorer for ML training data. Run a binary tournament bracket ov
 
 ## Scoring
 
+**Fast mode (single elimination):**
 ```
 score = round_reached / total_rounds
 ```
-
 Winner gets 1.0, runner-up gets ~0.667, semifinal losers get ~0.333, and so on.
+
+**Slow mode (double elimination):**
+```
+score = (N - placement) / (N - 1)
+```
+Placement is determined by final position in the bracket. Winner is 1, runner-up is 2, etc. Distinguishes quarterfinal losers from runners-up.
 
 ## API
 
@@ -36,6 +42,7 @@ Winner gets 1.0, runner-up gets ~0.667, semifinal losers get ~0.333, and so on.
 | `EXPORT_FOLDER` | (none) | If set, copies scored images here flat with `score_stem_hash.ext` filenames |
 | `SAMPLE_SIZE` | `0` | Randomly sample N images before tournament. 0 = use all |
 | `RESET` | (none) | Set to `1` or `true` to wipe existing tournament DBs on startup |
+| `TOURNAMENT_MODE` | `slow` | `slow` = double elimination with placement scoring; `normal` = single elimination |
 
 DATA_DIR is hardcoded to `/data` (SQLite DBs stored as `tournament_{uuid}.db`).
 
@@ -64,3 +71,4 @@ Arrows only work when a match is active and the UI is not disabled.
 - Bracket: pre-generated at tournament creation using seeded PRNG (same images = same bracket)
 - Voting: optimistic local update, fire-and-forget POST, server persists async
 - Images: served directly from filesystem, browser handles caching
+- Modes: `TOURNAMENT_MODE=slow` (default) runs double elimination with placement scoring; `TOURNAMENT_MODE=normal` runs single elimination
