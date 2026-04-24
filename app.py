@@ -614,12 +614,20 @@ async def collect_round_survivors(
               AND i.losers_entrance_round IS NULL
               AND i.round_reached >= ?
               AND (
+                  (
                   SELECT MAX(m.round)
                   FROM matches m
                   WHERE m.winner_path = i.image_path
                     AND m.tournament_id = i.tournament_id
                     AND m.bracket = 'winners'
               ) <= ?
+              OR NOT EXISTS (
+                  SELECT 1 FROM matches m
+                  WHERE m.winner_path = i.image_path
+                    AND m.tournament_id = i.tournament_id
+                    AND m.bracket = 'winners'
+              )
+              )
             ORDER BY i.image_path
             """,
             (tournament_uuid, round_number, round_number),
@@ -752,7 +760,7 @@ async def build_tournament_state_with_matches(
 
     completed_matches = int(row["completed_count"])
     total_images = int(row["total_images"])
-    mode = row["mode"] if "mode" in row else "normal"
+    mode = str(row["mode"]) if row["mode"] is not None else "normal"
     if mode == "slow":
         # Double elimination: winners bracket (N-1) + losers bracket (~N-2) + final (1)
         total_matches = max(2 * total_images - 2, 0)
@@ -778,7 +786,7 @@ async def build_tournament_state_with_matches(
         "currentMatchIndex": current_match_index,
         "currentMatchId": current_match_row["id"] if current_match_row else None,
         "lastMatchId": row["last_match_id"],
-        "winnersBracketComplete": bool(row["winners_bracket_complete"]) if "winners_bracket_complete" in row else False,
+        "winnersBracketComplete": bool(row["winners_bracket_complete"]),
         "currentMatch": serialize_match(current_match_row),
         "nextMatch": serialize_match(next_match_row),
         "matches": [
