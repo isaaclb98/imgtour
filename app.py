@@ -25,7 +25,7 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(__file__).parent / "qa_data"
+DATA_DIR = Path(__file__).parent / "data"
 INDEX_HTML = BASE_DIR / "index.html"
 
 IMAGE_EXTENSIONS = {
