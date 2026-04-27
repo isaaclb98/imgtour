@@ -25,7 +25,7 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path("/data")
+DATA_DIR = Path(__file__).parent / "qa_data"
 INDEX_HTML = BASE_DIR / "index.html"
 
 IMAGE_EXTENSIONS = {
@@ -1404,7 +1404,7 @@ async def undo_last_match(request: Request) -> Response:
             )
 
             await db.commit()
-            state_response = await build_tournament_state_with_matches(db, tournament_uuid)
+            state_response = await build_tournament_state_with_matches(db, tournament_uuid, None, None)
             app.state.active_uuid = tournament_uuid
             return JSONResponse(state_response)
 
