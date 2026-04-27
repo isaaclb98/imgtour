@@ -1,3 +1,5 @@
+from engine import TournamentEngine
+
 import asyncio
 import csv
 import hashlib
@@ -23,7 +25,7 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path("/data")
+DATA_DIR = Path(__file__).parent / "data"
 INDEX_HTML = BASE_DIR / "index.html"
 
 IMAGE_EXTENSIONS = {
@@ -1040,8 +1042,8 @@ async def record_match_result(request: Request) -> Response:
 
 async def vote_match(request: Request) -> Response:
     """
-    Fire-and-forget vote endpoint. Records winner, updates scores, returns immediately.
-    When a round completes, advances to the next round.
+    Fire-and-forget vote endpoint using TournamentEngine for state transitions.
+    Records winner, updates scores via engine, persists to DB.
     """
     match_id = int(request.path_params["match_id"])
     payload = await request.json()
@@ -1050,6 +1052,7 @@ async def vote_match(request: Request) -> Response:
         raise HTTPException(status_code=400, detail="winner is required")
 
     async with app.state.lock:
+        # Find the tournament DB for this match
         match_row = None
         target_db_path = None
         active_uuid = app.state.active_uuid
@@ -1093,12 +1096,12 @@ async def vote_match(request: Request) -> Response:
         db.row_factory = aiosqlite.Row
         try:
             tournament_uuid = str(match_row["tournament_id"])
-            tournament = await fetchone(
+            tournament_row = await fetchone(
                 db,
-                "SELECT id, status, total_rounds FROM tournaments WHERE id = ?",
+                "SELECT id, status, total_images, total_rounds, current_round, last_match_id FROM tournaments WHERE id = ?",
                 (tournament_uuid,),
             )
-            if tournament is None or tournament["status"] != "ACTIVE":
+            if tournament_row is None or tournament_row["status"] != "ACTIVE":
                 raise HTTPException(status_code=409, detail="Tournament is not active")
 
             if not winner.startswith("/"):
@@ -1109,69 +1112,98 @@ async def vote_match(request: Request) -> Response:
             if match_row["winner_path"] is not None:
                 return JSONResponse({"received": True})
 
+            # Build TournamentState from current DB state
+            tournament_uuid = tournament_row["id"]
+            mode = "fast"  # current code only supports fast mode (single elimination)
+            total_rounds = int(tournament_row["total_rounds"])
+
+            images_rows = await fetchall(db, "SELECT image_path, round_reached, wins, score FROM images WHERE tournament_id = ?", (tournament_uuid,))
+            matches_rows = await fetchall(db, "SELECT id, round, image_a_path, image_b_path, winner_path FROM matches WHERE tournament_id = ? ORDER BY id", (tournament_uuid,))
+
+            from engine import ImageState, MatchState
+            images = {r["image_path"]: ImageState(round_reached=int(r["round_reached"]), wins=int(r["wins"]), score=float(r["score"]), lives=1) for r in images_rows}
+            matches = [MatchState(id=r["id"], round=int(r["round"]), bracket="winners", image_a_path=r["image_a_path"], image_b_path=r["image_b_path"], winner_path=r["winner_path"]) for r in matches_rows]
+            next_match_id = max((r["id"] for r in matches_rows), default=0) + 1
+
+            from engine import TournamentState
+            state = TournamentState(
+                uuid=tournament_uuid,
+                status="ACTIVE",
+                mode=mode,
+                current_round=int(tournament_row["current_round"]),
+                total_images=int(tournament_row["total_images"]),
+                total_rounds=total_rounds,
+                total_matches=len(matches),
+                last_match_id=tournament_row["last_match_id"],
+                images=images,
+                matches=matches,
+                next_match_id=next_match_id,
+            )
+
+            # Use engine to compute new state
+            # Track the round we were on BEFORE the vote — the engine may advance
+            # current_round inside vote() when a round completes, so we need the
+            # pre-vote value to correctly detect round completion.
+            previous_round = state.current_round
+            try:
+                state = TournamentEngine.vote(state, match_id, winner)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            # Persist state changes to DB
             now = utc_now()
+
+            # Update match winner
             await db.execute(
                 "UPDATE matches SET winner_path = ?, completed_at = ? WHERE id = ?",
                 (winner, now, match_id),
             )
 
-            image_row = await fetchone(
-                db,
-                "SELECT round_reached, wins FROM images WHERE tournament_id = ? AND image_path = ?",
-                (tournament_uuid, winner),
-            )
-            if image_row:
-                await db.execute(
-                    "UPDATE images SET wins = wins + 1 WHERE tournament_id = ? AND image_path = ?",
-                    (tournament_uuid, winner),
-                )
-                await update_image_score(
-                    db, tournament_uuid, winner,
-                    int(image_row["round_reached"]) + 1,
-                    int(tournament["total_rounds"]),
-                )
-
+            # Update tournament last_match_id
             await db.execute(
                 "UPDATE tournaments SET last_match_id = ? WHERE id = ?",
                 (match_id, tournament_uuid),
             )
 
-            round_number = int(match_row["round"])
-            pending_row = await fetchone(
-                db,
-                """
-                SELECT COUNT(*) AS count
-                FROM matches
-                WHERE tournament_id = ? AND round = ? AND winner_path IS NULL
-                """,
-                (tournament_uuid, round_number),
-            )
-            pending_count = int(pending_row["count"]) if pending_row else 0
-
-            if pending_count == 0:
-                survivors = await collect_round_survivors(db, tournament_uuid, round_number)
-                if len(survivors) <= 1:
+            # If the round we were on is now complete, persist new matches
+            # Use previous_round (not state.current_round) because the engine may
+            # have already advanced current_round to the next round inside vote().
+            pending = [m for m in state.matches if m.round == previous_round and m.winner_path is None]
+            if not pending and len(state.matches) > len(matches_rows):
+                # New matches were added — insert them
+                new_matches = [m for m in state.matches if m.id not in [r["id"] for r in matches_rows]]
+                for m in new_matches:
                     await db.execute(
-                        """
-                        UPDATE tournaments
-                        SET status = 'COMPLETE', current_round = ?, completed_at = ?
-                        WHERE id = ?
-                        """,
-                        (round_number, utc_now(), tournament_uuid),
+                        "INSERT INTO matches (tournament_id, round, image_a_path, image_b_path, winner_path, completed_at) VALUES (?, ?, ?, ?, NULL, NULL)",
+                        (tournament_uuid, m.round, m.image_a_path, m.image_b_path),
                     )
-                    await db.commit()
-                    asyncio.create_task(copy_scored_images(tournament_uuid))
-                else:
-                    next_round = round_number + 1
+                # Advance the tournament's current_round to match the engine state
+                await db.execute(
+                    "UPDATE tournaments SET current_round = ? WHERE id = ?",
+                    (state.current_round, tournament_uuid),
+                )
+
+            # Persist image score updates
+            for path, img in state.images.items():
+                existing = next((r for r in images_rows if r["image_path"] == path), None)
+                if existing and (int(existing["round_reached"]) != img.round_reached or int(existing["wins"]) != img.wins or float(existing["score"]) != img.score):
                     await db.execute(
-                        "UPDATE tournaments SET current_round = ? WHERE id = ?",
-                        (next_round, tournament_uuid),
+                        "UPDATE images SET round_reached = ?, wins = ?, score = ? WHERE tournament_id = ? AND image_path = ?",
+                        (img.round_reached, img.wins, img.score, tournament_uuid, path),
                     )
-                    await create_round_matches(db, tournament_uuid, next_round, survivors, int(tournament["total_rounds"]))
 
-            await db.commit()
+            # Handle tournament completion
+            if state.status == "COMPLETE":
+                await db.execute(
+                    "UPDATE tournaments SET status = 'COMPLETE', current_round = ?, completed_at = ? WHERE id = ?",
+                    (state.current_round, now, tournament_uuid),
+                )
+                await db.commit()
+                asyncio.create_task(copy_scored_images(tournament_uuid))
+            else:
+                await db.commit()
 
-            # Build tournament state for the client (same pattern as record_match_result)
+            # Build response state
             t_row = await fetchone(db, "SELECT current_round FROM tournaments WHERE id = ?", (tournament_uuid,))
             current_round = int(t_row["current_round"])
             new_current_match = await fetchone(
@@ -1196,11 +1228,11 @@ async def vote_match(request: Request) -> Response:
                 """,
                 (tournament_uuid, current_round + 1),
             )
-            state = await build_tournament_state_with_matches(
+            state_response = await build_tournament_state_with_matches(
                 db, tournament_uuid, new_current_match, new_next_match
             )
-            app.state.active_uuid = tournament_uuid if state["status"] == "ACTIVE" else None
-            return JSONResponse({"received": True, "tournament": state}, status_code=202)
+            app.state.active_uuid = tournament_uuid if state_response["status"] == "ACTIVE" else None
+            return JSONResponse({"received": True, "tournament": state_response}, status_code=202)
         finally:
             await db.close()
 
@@ -1261,7 +1293,7 @@ async def undo_last_match(request: Request) -> Response:
             tournament = await fetchone(
                 db,
                 """
-                SELECT id, status, current_round, last_match_id, total_rounds
+                SELECT id, status, current_round, total_rounds, total_images, last_match_id
                 FROM tournaments
                 WHERE id = ?
                 """,
@@ -1275,7 +1307,8 @@ async def undo_last_match(request: Request) -> Response:
             last_match = await fetchone(
                 db,
                 """
-                SELECT id, tournament_id, round, image_a_path, image_b_path, winner_path, completed_at
+                SELECT id, tournament_id, round, image_a_path, image_b_path,
+                       winner_path, completed_at
                 FROM matches
                 WHERE id = ?
                 """,
@@ -1285,35 +1318,78 @@ async def undo_last_match(request: Request) -> Response:
                 raise HTTPException(status_code=409, detail="No completed match to undo")
 
             undone_round = int(last_match["round"])
-            winner_path = str(last_match["winner_path"])
             total_rounds = int(tournament["total_rounds"])
 
+            # Rollback future rounds BEFORE building state
+            # This deletes matches in rounds > undone_round and adjusts bye images
             await rollback_generated_future_rounds(db, tournament_uuid, undone_round, total_rounds)
 
-            winner_image = await fetchone(
+            # Build TournamentState from DB (lives not stored in DB, hardcoded to 1)
+            images_rows = await fetchall(
                 db,
-                "SELECT round_reached, wins FROM images WHERE tournament_id = ? AND image_path = ?",
-                (tournament_uuid, winner_path),
+                "SELECT image_path, round_reached, wins, score FROM images WHERE tournament_id = ?",
+                (tournament_uuid,),
             )
-            if winner_image is None:
-                raise HTTPException(status_code=500, detail="Winner image record missing")
-
-            await db.execute(
-                """
-                UPDATE images
-                SET wins = CASE WHEN wins > 0 THEN wins - 1 ELSE 0 END
-                WHERE tournament_id = ? AND image_path = ?
-                """,
-                (tournament_uuid, winner_path),
-            )
-            await update_image_score(
+            matches_rows = await fetchall(
                 db,
-                tournament_uuid,
-                winner_path,
-                max(int(winner_image["round_reached"]) - 1, 0),
-                total_rounds,
+                "SELECT id, round, image_a_path, image_b_path, winner_path FROM matches WHERE tournament_id = ?",
+                (tournament_uuid,),
             )
 
+            from engine import TournamentState as EngineState, ImageState, MatchState
+
+            images = {
+                row["image_path"]: ImageState(
+                    round_reached=int(row["round_reached"]),
+                    wins=int(row["wins"]),
+                    score=float(row["score"]),
+                    lives=1,  # lives not persisted in DB
+                )
+                for row in images_rows
+            }
+            matches = [
+                MatchState(
+                    id=int(row["id"]),
+                    round=int(row["round"]),
+                    bracket="winners",  # current code only supports single elimination
+                    image_a_path=str(row["image_a_path"]),
+                    image_b_path=str(row["image_b_path"]) if row["image_b_path"] else None,
+                    winner_path=str(row["winner_path"]) if row["winner_path"] else None,
+                )
+                for row in matches_rows
+            ]
+
+            state = EngineState(
+                uuid=tournament_uuid,
+                status=str(tournament["status"]),
+                mode="fast",  # mode not stored in DB
+                current_round=int(tournament["current_round"]),
+                total_images=int(tournament["total_images"]),
+                total_rounds=total_rounds,
+                total_matches=len(matches),
+                last_match_id=int(tournament["last_match_id"]) if tournament["last_match_id"] else None,
+                images=images,
+                matches=matches,
+                next_match_id=max((int(r["id"]) for r in matches_rows), default=0) + 1,
+            )
+
+            # Call engine.undo() - restores winner/loser image states and clears match winner
+            new_state = TournamentEngine.undo(state)
+
+            # Persist image state changes (only update if values changed, lives not in DB schema)
+            for path, img in new_state.images.items():
+                existing = next((r for r in images_rows if r["image_path"] == path), None)
+                if existing and (
+                    int(existing["round_reached"]) != img.round_reached
+                    or int(existing["wins"]) != img.wins
+                    or float(existing["score"]) != img.score
+                ):
+                    await db.execute(
+                        "UPDATE images SET round_reached = ?, wins = ?, score = ? WHERE tournament_id = ? AND image_path = ?",
+                        (img.round_reached, img.wins, img.score, tournament_uuid, path),
+                    )
+
+            # Clear match winner in DB
             await db.execute(
                 """
                 UPDATE matches
@@ -1323,34 +1399,25 @@ async def undo_last_match(request: Request) -> Response:
                 (int(last_match["id"]),),
             )
 
-            previous_match = await fetchone(
-                db,
-                """
-                SELECT id
-                FROM matches
-                WHERE tournament_id = ? AND winner_path IS NOT NULL AND id < ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (tournament_uuid, int(last_match["id"])),
-            )
-
+            # Update tournament (status, current_round, last_match_id)
             await db.execute(
                 """
                 UPDATE tournaments
-                SET status = 'ACTIVE',
-                    current_round = ?,
-                    last_match_id = ?,
-                    completed_at = NULL
+                SET status = ?, current_round = ?, last_match_id = ?, completed_at = NULL
                 WHERE id = ?
                 """,
-                (max(undone_round - 1, 1), previous_match["id"] if previous_match else None, tournament_uuid),
+                (
+                    new_state.status,
+                    max(undone_round - 1, 1),
+                    new_state.last_match_id if new_state.last_match_id else None,
+                    tournament_uuid,
+                ),
             )
 
             await db.commit()
-            state = await build_tournament_state(db, tournament_uuid)
+            state_response = await build_tournament_state_with_matches(db, tournament_uuid, None, None)
             app.state.active_uuid = tournament_uuid
-            return JSONResponse(state)
+            return JSONResponse(state_response)
 
 
 async def export_tournament(request: Request) -> Response:
