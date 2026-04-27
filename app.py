@@ -1141,6 +1141,10 @@ async def vote_match(request: Request) -> Response:
             )
 
             # Use engine to compute new state
+            # Track the round we were on BEFORE the vote — the engine may advance
+            # current_round inside vote() when a round completes, so we need the
+            # pre-vote value to correctly detect round completion.
+            previous_round = state.current_round
             try:
                 state = TournamentEngine.vote(state, match_id, winner)
             except ValueError as e:
@@ -1161,8 +1165,10 @@ async def vote_match(request: Request) -> Response:
                 (match_id, tournament_uuid),
             )
 
-            # If round is now complete, persist new matches
-            pending = [m for m in state.matches if m.round == state.current_round and m.winner_path is None]
+            # If the round we were on is now complete, persist new matches
+            # Use previous_round (not state.current_round) because the engine may
+            # have already advanced current_round to the next round inside vote().
+            pending = [m for m in state.matches if m.round == previous_round and m.winner_path is None]
             if not pending and len(state.matches) > len(matches_rows):
                 # New matches were added — insert them
                 new_matches = [m for m in state.matches if m.id not in [r["id"] for r in matches_rows]]
@@ -1171,6 +1177,11 @@ async def vote_match(request: Request) -> Response:
                         "INSERT INTO matches (tournament_id, round, image_a_path, image_b_path, winner_path, completed_at) VALUES (?, ?, ?, ?, NULL, NULL)",
                         (tournament_uuid, m.round, m.image_a_path, m.image_b_path),
                     )
+                # Advance the tournament's current_round to match the engine state
+                await db.execute(
+                    "UPDATE tournaments SET current_round = ? WHERE id = ?",
+                    (state.current_round, tournament_uuid),
+                )
 
             # Persist image score updates
             for path, img in state.images.items():
